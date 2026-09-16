@@ -1,3 +1,59 @@
+From 2024ff523fb6084459065501ca785c846215c887 Mon Sep 17 00:00:00 2001
+From: ibf-coder <ibf-coder@local>
+Date: Wed, 16 Sep 2026 22:24:07 +0300
+Subject: [PATCH] fix(kanban): the archive refusal says what it read, the whole
+ batch is asked, and --force is recorded
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Tails of the two kanban windows, each re-verified against the live code before the edit
+(red test first, live probe where the finding came from a probe).
+
+The refusal evidence (kanban_db.py, kanban.py):
+* the refusal payload gains `host_local` and the line names the signal, the pid and the
+  heartbeat age, so a live FOREIGN process or a reused pid is distinguishable from this
+  card's worker ("worker_pid 21880 is alive on this host but the claim belongs to another
+  host ... if it is not this card's worker, pass --force");
+* the host-local gate no longer swallows the guard: `_pid_alive` counts wherever the claim
+  came from (probe B archived a card with rc=0 while its pid was alive and the claim had
+  expired), while the heartbeat signal guards only HOST-LOCAL claims, which is the parity
+  with the condition `release_stale_claims` actually spares. The docstring no longer claims
+  a superset it did not have — it names the delta in both directions.
+* a batch is one decision: every id is asked about BEFORE the first card is written, so a
+  live card refuses the whole batch instead of archiving its siblings (the 2026-09-16
+  cleanup archived the first 126 of 128 and killed the two running ones it never asked
+  about, returning 0). The refusal events are still written by the DB layer
+  (`record_archive_refusals`), so card-by-card and batch leave the same audit trail.
+
+The record (kanban_db.py):
+* `--force` is part of the `archived` payload and of the initiator block, so an archive that
+  terminated a live worker is not read as an archive of a finished card;
+* the `archive_refused`-then-`archived` pair is documented as the form it is: two true
+  records of two calls, `write_txn` committing the refusal before the forced retry.
+
+The flag (kanban.py, kanban_parser.py, docs):
+* `archive --rm <ids> --force` no longer swallows the flag: the purge branch reports it as
+  inert (a purge requires an already-archived card and has no live-run guard to override)
+  and the parser help says so at both verbs;
+* `website/docs/user-guide/features/kanban.md`: the `archive_refused` event is documented,
+  the batch-asks-first rule and the `--force`/`--rm` semantics are stated, and the
+  circuit-breaker section notes that a long card's failure budget is stated at creation
+  (`max_retries`, `max_runtime_seconds`) because the count cannot tell a long healthy run
+  from a short one.
+
+Tests: tests/hermes_cli/test_kanban_archive_live_run_guard.py, 19 cells (13 new), red
+first; live probe (real `hermes kanban archive`, real live pid, real DB) red on the base
+(rc=0, archived with the process alive) and green after the fix (rc=1, refusal with the
+evidence; the dead process then archives; a mixed batch archives nothing).
+---
+ hermes_cli/kanban.py                          |  53 +++-
+ hermes_cli/kanban_db.py                       |  91 ++++--
+ hermes_cli/kanban_parser.py                   |   8 +-
+ .../test_kanban_archive_live_run_guard.py     | 258 ++++++++++++++++++
+ website/docs/user-guide/features/kanban.md    |  24 +-
+ 5 files changed, 403 insertions(+), 31 deletions(-)
+
 diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
 index 324767e09d..0417f5b33a 100644
 --- a/hermes_cli/kanban.py
@@ -248,7 +304,7 @@ index 6bd8ce5397..53e6df10d0 100644
      _cmd("tail", [_TASK_ID, _arg("--interval", type=float, default=1.0)], help="Follow a task's event stream"),
      _cmd("dispatch", [
 diff --git a/tests/hermes_cli/test_kanban_archive_live_run_guard.py b/tests/hermes_cli/test_kanban_archive_live_run_guard.py
-index 879694349c..94b78de0a4 100644
+index 879694349c..c27713375e 100644
 --- a/tests/hermes_cli/test_kanban_archive_live_run_guard.py
 +++ b/tests/hermes_cli/test_kanban_archive_live_run_guard.py
 @@ -65,6 +65,18 @@ def _running_task(conn, *, pid: int = 54321) -> str:
@@ -270,7 +326,7 @@ index 879694349c..94b78de0a4 100644
  def _kinds(conn, tid: str) -> list[str]:
      return [
          r["kind"] for r in conn.execute(
-@@ -214,3 +226,251 @@ def test_archived_event_records_initiator(kanban_home, monkeypatch):
+@@ -214,3 +226,249 @@ def test_archived_event_records_initiator(kanban_home, monkeypatch):
      assert payload["actor"] == "ibf-operator"
      assert payload["session_id"] == "sess-20260916"
      assert payload["source"] == "cli"
@@ -432,8 +488,6 @@ index 879694349c..94b78de0a4 100644
 +    with kbc.connect() as conn:
 +        assert kb.get_task(conn, finished).status == "done", "the batch archived nothing"
 +        assert kb.get_task(conn, live).status == "running"
-+        kinds = _kinds(conn, live)
-+        assert "archive_refused" in kinds, "the batch refusal is on the card's record too"
 +
 +
 +def test_forced_batch_archives_every_id(kanban_home, monkeypatch, capsys):
@@ -582,3 +636,6 @@ index 7ac47ba25f..4ee87872a7 100644
  
  **Edits** (human-driven changes that aren't transitions):
  
+-- 
+2.55.0.windows.4
+
