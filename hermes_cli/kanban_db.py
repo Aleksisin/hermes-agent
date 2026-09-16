@@ -3623,8 +3623,85 @@ def specify_triage_task(
     return True
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:
+def _live_run_from_row(row: sqlite3.Row) -> Optional[dict[str, Any]]:
+    """Liveness evidence for a task row whose run may still be alive; None when archive-safe.
+
+    Two signals, both gated on a HOST-LOCAL claim (a worker claimed by another host cannot be
+    signalled from here, so its archive stays a plain status change):
+
+    * the worker process answers ``_pid_alive``;
+    * ``last_heartbeat_at`` is fresher than ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS``.
+
+    This is deliberately a superset of the condition ``release_stale_claims`` spares a claim
+    with: refusing costs one ``--force``, waving a live worker through costs the worker.
+    """
+    if row["status"] != "running":
+        return None
+    if not (row["claim_lock"] or "").startswith(_host_prefix()):
+        return None
+    now = int(time.time())
+    heartbeat = row["last_heartbeat_at"]
+    age = None if heartbeat is None else now - int(heartbeat)
+    heartbeat_fresh = age is not None and age <= DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+    pid = _opt_int(row["worker_pid"])
+    pid_alive = bool(pid) and _pid_alive(pid)
+    if not pid_alive and not heartbeat_fresh:
+        return None
+    return {
+        "worker_pid": pid,
+        "claim_lock": row["claim_lock"],
+        "reason": "pid_alive" if pid_alive else "fresh_heartbeat",
+        "heartbeat_age": age,
+        "claim_expires": _opt_int(row["claim_expires"]),
+    }
+
+
+_LIVE_RUN_COLUMNS = "status, claim_lock, worker_pid, last_heartbeat_at, claim_expires"
+
+
+def live_run_info(conn: sqlite3.Connection, task_id: str) -> Optional[dict[str, Any]]:
+    """``_live_run_from_row`` for ``task_id``; None when it has no run worth protecting.
+
+    The refusal evidence an operator needs (worker pid + which signal says "alive"), so a
+    caller can name the pid instead of reporting a bare "cannot archive" (2026-09-16: a batch
+    archived 128 ibf cards and silently killed the two RUNNING ones among them).
+    """
+    row = conn.execute(
+        f"SELECT {_LIVE_RUN_COLUMNS} FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    return _live_run_from_row(row) if row else None
+
+
+def _archive_initiator(actor: Optional[str], source: Optional[str]) -> dict[str, Any]:
+    """Who is archiving: profile, session, calling surface.
+
+    ``task_events`` has no actor column and every ``archived`` payload was NULL, so after the
+    2026-09-16 cleanup nobody could say who had taken the board down. The initiator rides in
+    the existing ``payload`` field — no schema change.
+    """
+    initiator: dict[str, Any] = {
+        "actor": (actor or "").strip() or _hook_profile_name(),
+        "source": (source or "").strip() or os.environ.get("HERMES_SESSION_SOURCE") or "unknown",
+    }
+    session_id = os.environ.get("HERMES_SESSION_ID")
+    if session_id:
+        initiator["session_id"] = session_id
+    return initiator
+
+
+def archive_task(
+    conn: sqlite3.Connection, task_id: str, *, signal_fn=None,
+    actor: Optional[str] = None, source: Optional[str] = None, force: bool = False,
+) -> bool:
     """Archive a task; a *running* task's host-local worker is terminated.
+
+    Refuses (False, nothing touched) while the task's run is still LIVE
+    (:func:`live_run_info`) unless ``force`` — the operator's explicit override. Archiving
+    used to look identical for a finished and a running card: the 2026-09-16 ibf cleanup
+    archived 128 cards in one batch, killed the two workers that were still running, asked
+    nothing and returned 0. ``archive_refused`` records the refusal with its evidence.
+    The ``archived`` event always carries the initiator (profile, session, surface), as does
+    the termination report — the two events that say what happened to a live card.
 
     Clearing ``worker_pid`` in the DB alone left the OS process running past its
     own archive — it kept executing (and pushing work) against a task nothing
@@ -3637,12 +3714,16 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     termination outcome lands as its own ``archive_worker_termination`` event so
     the ``archived`` event stays atomic with the status flip.
     """
+    initiator = _archive_initiator(actor, source)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
-            (task_id,),
+            f"SELECT {_LIVE_RUN_COLUMNS} FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if not row:
+            return False
+        live = None if force else _live_run_from_row(row)
+        if live is not None:
+            _append_event(conn, task_id, "archive_refused", {**initiator, **live})
             return False
         was_running = row["status"] == "running"
         prev_pid, prev_lock = row["worker_pid"], row["claim_lock"]
@@ -3658,11 +3739,14 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
             conn, task_id, outcome="reclaimed", status="reclaimed",
             summary="task archived with run still active",
         )
-        _append_event(conn, task_id, "archived", None, run_id=run_id)
+        _append_event(conn, task_id, "archived", initiator, run_id=run_id)
     if was_running:
         termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn)
         with write_txn(conn):
-            _append_event(conn, task_id, "archive_worker_termination", termination, run_id=run_id)
+            _append_event(
+                conn, task_id, "archive_worker_termination", {**termination, **initiator},
+                run_id=run_id,
+            )
     # ``archived`` parents no longer block children; promote them now.
     recompute_ready(conn)
     # Reap the workspace on archive too (never-completed tasks kept it forever).

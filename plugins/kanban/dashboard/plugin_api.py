@@ -602,7 +602,9 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
     (naming the blocking parent(s) for ``ready`` so the UI renders an actionable toast)."""
     s = payload.status
     if s == "archived":
-        ok = kanban_db.archive_task(conn, task_id)
+        # A card whose run is still live is refused (409 below) instead of being archived
+        # with its worker killed silently; the panel's escape is `hermes kanban archive --force`.
+        ok = kanban_db.archive_task(conn, task_id, source="dashboard")
     else:
         with _map_errors(400, _StatusRejected):
             ok = _apply_status(conn, task_id, s, payload, f"unknown status: {s}")
@@ -776,8 +778,13 @@ def delete_link(parent_id: str = Query(...), child_id: str = Query(...), board: 
 
 def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str], entry: dict) -> None:
     """Apply the bulk patch to one task, recording refusals in ``entry`` without aborting the
-    remaining ops — except a rejected status verb (``_StatusRejected`` propagates)."""
-    if payload.archive and not kanban_db.archive_task(conn, tid):
+    remaining ops — except a rejected status verb (``_StatusRejected`` propagates).
+
+    ``archive_task`` refuses a card whose run is still live: the refusal lands per-id (the
+    whole batch is never aborted for it) and the operator archives with ``hermes kanban
+    archive --force``, which is also what makes the panel's mass cleanup stop there.
+    """
+    if payload.archive and not kanban_db.archive_task(conn, tid, source="dashboard-batch"):
         entry.update(ok=False, error="archive refused")
     if payload.status is not None and not payload.archive:
         s = payload.status

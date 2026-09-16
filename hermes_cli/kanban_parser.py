@@ -334,6 +334,8 @@ _SPECS = [
     ], help="Manually move one or more todo/blocked tasks to ready (recovery path)"),
     _cmd("archive", [
         _arg("task_ids", nargs="*", help="Task ids to archive (default mode)"),
+        _arg("--force", action="store_true",
+             help="Archive even when the card's run is still live (terminates its worker)"),
         _arg("--rm", dest="purge_ids", nargs="+",
              help="Permanently delete already-archived task ids from the board"),
     ], help="Archive one or more tasks"),
