@@ -321,12 +321,21 @@ hermes kanban unblock  t_abc t_def
 hermes kanban block    t_abc "need input" --ids t_def t_hij
 ```
 
-`archive` asks before it touches anything: a card whose run is still live (its worker pid answers,
-or a heartbeat this host wrote is inside the stale window) is refused with `archive_refused`, and
-for a batch **no** card is archived when one is refused. `--force` is the operator's one override
-for the call — it archives anyway and terminates the worker; the `archived` event records
-`force: true`, so a terminated worker is never read as a silent archive. `--rm <ids>` purges
-already-archived cards and takes no `--force` (it names the flag if you pass it).
+`archive` asks before it touches anything: a card whose run is still live (its worker pid answers —
+wherever the claim came from, a live pid is evidence work is in progress — or a heartbeat written
+by *this* host is inside the stale window) is refused with `archive_refused`, and for a batch **no**
+card is archived when one is refused. `--force` is the operator's one override for the call — it
+archives anyway and terminates the worker; the `archived` event records `force: true`, so a
+terminated worker is never read as a silent archive. `--rm <ids>` purges already-archived cards and
+takes no `--force` (it names the flag if you pass it).
+
+:::note Declared limit of the guard (multi-host fleets)
+The heartbeat signal guards only claims this host owns (a heartbeat is written by the worker's own
+machine). A claim from another host whose deadline is NULL or already past and whose pid does not
+answer is therefore not protected — the dispatcher's `release_stale_claims` does not scan a NULL
+deadline at all, so on one host that row is the ordinary stuck-card cleanup and the archive takes
+it by design. Across hosts it is the residual hole: only the pid signal is checkable from here.
+:::
 
 :::note Where an unblocked task lands
 `unblock` restores the safe source phase: **`review`** for reviewer-origin work

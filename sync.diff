@@ -1,0 +1,230 @@
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 8543863743..58e7526b1f 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3760,30 +3760,47 @@ def specify_triage_task(
+ def _live_run_from_row(row: sqlite3.Row) -> Optional[dict[str, Any]]:
+     """Liveness evidence for a task row whose run may still be alive; None when archive-safe.
+ 
+-    Two signals, both gated on a HOST-LOCAL claim (a worker claimed by another host cannot be
+-    signalled from here, so its archive stays a plain status change):
+-
+-    * the worker process answers ``_pid_alive``;
+-    * ``last_heartbeat_at`` is fresher than ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS``.
+-
+-    This is deliberately a superset of the condition ``release_stale_claims`` spares a claim
+-    with: refusing costs one ``--force``, waving a live worker through costs the worker.
++    Two signals:
++
++    * the worker process answers ``_pid_alive`` — wherever the claim came from, a live
++      process on this host is evidence of work in progress, and the claim lock saying
++      "another host" does not make it not-ours (probe B: an expired foreign claim plus a
++      live local pid archived with rc=0 and no question asked);
++    * ``last_heartbeat_at`` is fresher than ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` on a
++      claim this host owns — the state ``release_stale_claims`` spares and extends.
++
++    ``host_local`` is REPORTED, not a gate: it says whether the pid in the evidence is one
++    this host can signal. Refusing costs one ``--force``; waving a live worker through costs
++    the worker. Against the condition ``release_stale_claims`` spares a claim with, the
++    evidence is the same spared set plus a live pid under a foreign lock (that pid is not the
++    claim's worker), minus a heartbeat-only claim that has already expired — the dispatcher
++    reclaims those as ordinary stuck cards, so the archive must not refuse what the tick will
++    take anyway. Expiry is not a liveness signal here at all.
++
++    Declared limit (multi-host fleets): a row whose ``claim_expires`` is NULL never enters
++    ``release_stale_claims``' scan (its WHERE requires a non-NULL deadline), so such a claim is
++    never extended by the tick — and a FOREIGN claim with a fresh heartbeat and no live pid
++    answers ``None`` here, i.e. the archive judges it by the pid alone. On one host that is the
++    same row the dispatcher can see; across hosts it is the residual hole of this predicate: the
++    heartbeat is evidence, but this host cannot tell which machine wrote it, and only the pid
++    signal is host-checkable. Widening the heartbeat signal to foreign claims would fix it and
++    is a deliberate non-goal here (it changes what one host may archive on another host's word).
+     """
+     if row["status"] != "running":
+         return None
+-    if not (row["claim_lock"] or "").startswith(_host_prefix()):
+-        return None
++    host_local = (row["claim_lock"] or "").startswith(_host_prefix())
+     now = int(time.time())
+     heartbeat = row["last_heartbeat_at"]
+     age = None if heartbeat is None else now - int(heartbeat)
+     heartbeat_fresh = age is not None and age <= DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+     pid = _opt_int(row["worker_pid"])
+     pid_alive = bool(pid) and _pid_alive(pid)
+-    if not pid_alive and not heartbeat_fresh:
++    if not pid_alive and not (heartbeat_fresh and host_local):
+         return None
+     return {
+         "worker_pid": pid,
+         "claim_lock": row["claim_lock"],
++        "host_local": host_local,
+         "reason": "pid_alive" if pid_alive else "fresh_heartbeat",
+         "heartbeat_age": age,
+         "claim_expires": _opt_int(row["claim_expires"]),
+@@ -3796,9 +3813,10 @@ _LIVE_RUN_COLUMNS = "status, claim_lock, worker_pid, last_heartbeat_at, claim_ex
+ def live_run_info(conn: sqlite3.Connection, task_id: str) -> Optional[dict[str, Any]]:
+     """``_live_run_from_row`` for ``task_id``; None when it has no run worth protecting.
+ 
+-    The refusal evidence an operator needs (worker pid + which signal says "alive"), so a
+-    caller can name the pid instead of reporting a bare "cannot archive" (2026-09-16: a batch
+-    archived 128 ibf cards and silently killed the two RUNNING ones among them).
++    The refusal evidence an operator needs (worker pid, its host-locality, which signal says
++    "alive"), so a caller can name the pid instead of reporting a bare "cannot archive"
++    (2026-09-16: a batch archived 128 ibf cards and silently killed the two RUNNING ones among
++    them). Same predicate as the guard: what this returns is what ``archive_task`` refused on.
+     """
+     row = conn.execute(
+         f"SELECT {_LIVE_RUN_COLUMNS} FROM tasks WHERE id = ?", (task_id,),
+@@ -3806,16 +3824,49 @@ def live_run_info(conn: sqlite3.Connection, task_id: str) -> Optional[dict[str,
+     return _live_run_from_row(row) if row else None
+ 
+ 
+-def _archive_initiator(actor: Optional[str], source: Optional[str]) -> dict[str, Any]:
+-    """Who is archiving: profile, session, calling surface.
++def record_archive_refusals(
++    conn: sqlite3.Connection, task_ids: Iterable[str], *,
++    actor: Optional[str] = None, source: Optional[str] = None,
++) -> list[tuple[str, dict[str, Any]]]:
++    """Ask the archive guard about a WHOLE batch before the first write.
++
++    Returns ``[(task_id, live evidence)]`` for every id whose run is live, already recorded as
++    an ``archive_refused`` event; empty when the batch is safe to archive. A batch is one
++    operator decision, so it is asked before the first card is touched (2026-09-16: a 128-card
++    cleanup archived the first 126, killed the two running ones it never asked about, and
++    returned 0). The event stays the DB layer's to write, so the audit trail is the same
++    whether a caller refuses card by card (:func:`archive_task`) or up front (here).
++    """
++    initiator = _archive_initiator(actor, source)
++    refused: list[tuple[str, dict[str, Any]]] = []
++    with write_txn(conn):
++        for task_id in task_ids:
++            live = live_run_info(conn, task_id)
++            if live is None:
++                continue
++            _append_event(conn, task_id, "archive_refused", {**initiator, **live})
++            refused.append((task_id, live))
++    return refused
++
++
++def _archive_initiator(
++    actor: Optional[str], source: Optional[str], *, force: bool = False,
++) -> dict[str, Any]:
++    """Who is archiving — profile, session, calling surface — and whether they overrode the guard.
+ 
+     ``task_events`` has no actor column and every ``archived`` payload was NULL, so after the
+     2026-09-16 cleanup nobody could say who had taken the board down. The initiator rides in
+     the existing ``payload`` field — no schema change.
++
++    ``force`` rides with it because the ``archived`` event is the only record of the archive:
++    without the flag, an archive that terminated a live worker reads exactly like a card that
++    was already finished (the same payload, the only difference a ``terminated`` field on an
++    event the operator has to know to look for).
+     """
+     initiator: dict[str, Any] = {
+         "actor": (actor or "").strip() or _hook_profile_name(),
+         "source": (source or "").strip() or os.environ.get("HERMES_SESSION_SOURCE") or "unknown",
++        "force": bool(force),
+     }
+     session_id = os.environ.get("HERMES_SESSION_ID")
+     if session_id:
+@@ -3833,9 +3884,13 @@ def archive_task(
+     (:func:`live_run_info`) unless ``force`` — the operator's explicit override. Archiving
+     used to look identical for a finished and a running card: the 2026-09-16 ibf cleanup
+     archived 128 cards in one batch, killed the two workers that were still running, asked
+-    nothing and returned 0. ``archive_refused`` records the refusal with its evidence.
+-    The ``archived`` event always carries the initiator (profile, session, surface), as does
+-    the termination report — the two events that say what happened to a live card.
++    nothing and returned 0. ``archive_refused`` records the refusal with its evidence
++    (``worker_pid``, ``host_local``, which signal, the heartbeat age) — the evidence is
++    REPORTING only, the guard's decision is the same in every caller, and it is deliberately
++    coarser than ``release_stale_claims``: a live pid under a foreign claim refuses too,
++    because a reused pid cannot be told from a worker at this layer. The ``archived`` event
++    always carries the initiator (profile, session, surface, ``force``), as does the
++    termination report — the two events that say what happened to a live card.
+ 
+     Clearing ``worker_pid`` in the DB alone left the OS process running past its
+     own archive — it kept executing (and pushing work) against a task nothing
+@@ -3847,8 +3902,13 @@ def archive_task(
+     dispatcher can spawn a duplicate worker off the released claim. The
+     termination outcome lands as its own ``archive_worker_termination`` event so
+     the ``archived`` event stays atomic with the status flip.
++
++    ``archive_refused`` sits in the event history NEXT TO the successful ``archived`` that
++    follows it on a forced retry: both are true records of the two calls — ``write_txn``
++    commits on exit, so the refusal is durable before the forced archive is attempted, and
++    the pair is the point (the card was asked about, then overridden).
+     """
+-    initiator = _archive_initiator(actor, source)
++    initiator = _archive_initiator(actor, source, force=force)
+     with write_txn(conn):
+         row = conn.execute(
+             f"SELECT {_LIVE_RUN_COLUMNS} FROM tasks WHERE id = ?", (task_id,),
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 7ac47ba25f..8fc849a058 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -316,11 +316,27 @@ in one command:
+ 
+ ```bash
+ hermes kanban complete t_abc t_def t_hij --result "batch wrap"
+-hermes kanban archive  t_abc t_def t_hij
++hermes kanban archive  t_abc t_def t_hij          # refuses the whole batch if any card is still running
+ hermes kanban unblock  t_abc t_def
+ hermes kanban block    t_abc "need input" --ids t_def t_hij
+ ```
+ 
++`archive` asks before it touches anything: a card whose run is still live (its worker pid answers —
++wherever the claim came from, a live pid is evidence work is in progress — or a heartbeat written
++by *this* host is inside the stale window) is refused with `archive_refused`, and for a batch **no**
++card is archived when one is refused. `--force` is the operator's one override for the call — it
++archives anyway and terminates the worker; the `archived` event records `force: true`, so a
++terminated worker is never read as a silent archive. `--rm <ids>` purges already-archived cards and
++takes no `--force` (it names the flag if you pass it).
++
++:::note Declared limit of the guard (multi-host fleets)
++The heartbeat signal guards only claims this host owns (a heartbeat is written by the worker's own
++machine). A claim from another host whose deadline is NULL or already past and whose pid does not
++answer is therefore not protected — the dispatcher's `release_stale_claims` does not scan a NULL
++deadline at all, so on one host that row is the ordinary stuck-card cleanup and the archive takes
++it by design. Across hosts it is the residual hole: only the pid signal is checkable from here.
++:::
++
+ :::note Where an unblocked task lands
+ `unblock` restores the safe source phase: **`review`** for reviewer-origin work
+ whose parents are complete, **`ready`** for implementation work whose parents
+@@ -839,7 +855,7 @@ hermes kanban comment <id> "<text>" [--author NAME]
+ hermes kanban complete <id>... [--result "..."]
+ hermes kanban block <id> "<reason>" [--ids <id>...]
+ hermes kanban unblock <id>...
+-hermes kanban archive <id>...
++hermes kanban archive <id>... [--force] [--rm <archived-id>...]
+ 
+ hermes kanban request-review <id> [--summary "..."] [--metadata JSON] [--reviewer PROFILE]
+ hermes kanban request-changes <id> "<required changes>"               # active reviewer -> implementer
+@@ -874,6 +890,16 @@ All commands are also available as a slash command in the interactive CLI and in
+ 
+ `--max-retries` is a per-task circuit-breaker override for the dispatcher. `--max-retries 1` blocks the task on the first non-successful attempt, while `--max-retries 3` allows two retries and blocks on the third failure. Omit it to use `kanban.failure_limit` from `config.yaml`, then the built-in default.
+ 
++**A long card and the breaker.** The counter counts *consecutive* failures of any kind (`crashed`,
++`timed_out`, `spawn_failed`) and only `complete_task` resets it, so a multi-hour card that crashed
++once in the middle sits at `1` — and one more crash would auto-block it for a human. Nothing
++distinguishes a long healthy run from a short one in that count, so state the budget at creation:
++`max_retries` for the failure budget and `max_runtime_seconds` as the per-attempt cap the
++dispatcher enforces. Raising `kanban.failure_limit` is the fleet-wide version of the same choice,
++paid for by every short card whose profile is misconfigured (it then takes that many failed spawns
++to block). `hermes kanban show <id>` prints the effective threshold (`task`, `config` or `default`)
++so the budget is visible before the crash, not after.
++
+ ### Concurrency, scheduling, and child promotion config
+ 
+ | Config key | Default | What it does |
+@@ -1256,7 +1282,8 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
+ | `dependency_wait` | `{reason, kind}` | Worker blocked with `kind=dependency` — the task is only waiting on another task, so it routes to `todo` (parent-gated, auto-promoted) instead of `blocked`. No human needed. |
+ | `block_loop_detected` | `{reason, kind, recurrences, limit}` | A task was unblocked and re-blocked for the same reason `BLOCK_RECURRENCE_LIMIT` times (default 2). Instead of landing in `blocked` again — where a cron would keep unblocking it — it routes to `triage` for a human decision, breaking the unblock↔re-block loop. |
+ | `unblocked` | — | `blocked → ready` (or `todo` if parents are still open), either manually or via `/unblock`. Resets the dispatcher's `consecutive_failures` but deliberately preserves `block_recurrences` so the loop breaker keeps its memory. `run_id` is `NULL`. |
+-| `archived` | — | Hidden from the default board. If the task was still running, carries the `run_id` of the run that was reclaimed as a side effect. |
++| `archived` | — | Hidden from the default board. Carries the initiator (`{actor, source, session_id?, force}`) so a cleanup that took live work down can be attributed afterwards; `force: true` means the archive overrode the live-run guard. If the task was still running, carries the `run_id` of the run that was reclaimed as a side effect. |
++| `archive_refused` | `{actor, source, session_id?, force, worker_pid, claim_lock, host_local, reason, heartbeat_age, claim_expires}` | `hermes kanban archive` (or the dashboard) refused to archive a card whose run is still live, without `--force`. `reason` is `pid_alive` or `fresh_heartbeat`; `host_local` says whether that pid is one this host can signal (a live pid under another host's claim refuses too — a reused pid cannot be told from a real worker at this layer). For a batch, the whole id list is asked before the first card is archived, so a refusal means **nothing** in the batch was archived. |
+ 
+ **Edits** (human-driven changes that aren't transitions):
+ 

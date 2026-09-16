@@ -1,31 +1,31 @@
 probe sources: C:\Users\shogu\AppData\Local\hermes\hermes-agent
-probe db:      C:\Users\shogu\AppData\Local\Temp\archive-probe-qmw63xso\.hermes\probe-kanban.db
-live process on this host: pid 11876
+probe db:      C:\Users\shogu\AppData\Local\Temp\archive-probe-cvrgscwl\.hermes\probe-kanban.db
+live process on this host: pid 12368
 
-card t_93b780e7: status=running claim_lock=otherhost:worker claim_expires=expired
-archive guard says: {'worker_pid': 11876, 'claim_lock': 'otherhost:worker', 'host_local': False, 'reason': 'pid_alive', 'heartbeat_age': None, 'claim_expires': 1789586723}
+card t_7625b71f: status=running claim_lock=otherhost:worker claim_expires=expired
+archive guard says: {'worker_pid': 12368, 'claim_lock': 'otherhost:worker', 'host_local': False, 'reason': 'pid_alive', 'heartbeat_age': None, 'claim_expires': 1789587115}
 
-[1] hermes kanban archive t_93b780e7  (process ALIVE) -> rc=1
-    cannot archive t_93b780e7: worker_pid 11876 is alive on this host but the claim belongs to another host (pid_alive, no heartbeat recorded); if it is not this card's worker, pass --force to terminate it and archive
+[1] hermes kanban archive t_7625b71f  (process ALIVE) -> rc=1
+    cannot archive t_7625b71f: worker_pid 12368 is alive on this host but the claim belongs to another host (pid_alive, no heartbeat recorded); if it is not this card's worker, pass --force to terminate it and archive
     status now: running
     events:
       created: {"assignee": "ibf-coder", "status": "ready", "parents": [], "creator_task_id": null, "tenant": null, "workspace_kind": "scratch", "workspace_path": null, "branch_name": null, "project_id": null, "skills": null, "goal_mode": null, "model_override": null, "provider_override": null}
-      claimed: {"lock": "otherhost:worker", "expires": 1789587683, "run_id": 1}
-      spawned: {"pid": 11876}
-      archive_refused: {"actor": "ibf-coder", "source": "cli", "force": false, "session_id": "20260916_214226_a9933b", "worker_pid": 11876, "claim_lock": "otherhost:worker", "host_local": false, "reason": "pid_alive", "heartbeat_age": null, "claim_expires": 1789586723}
+      claimed: {"lock": "otherhost:worker", "expires": 1789588075, "run_id": 1}
+      spawned: {"pid": 12368}
+      archive_refused: {"actor": "ibf-coder", "source": "cli", "force": false, "session_id": "20260916_214226_a9933b", "worker_pid": 12368, "claim_lock": "otherhost:worker", "host_local": false, "reason": "pid_alive", "heartbeat_age": null, "claim_expires": 1789587115}
 
-[2] hermes kanban archive t_93b780e7  (process dead) -> rc=0
-    Archived t_93b780e7
+[2] hermes kanban archive t_7625b71f  (process dead) -> rc=0
+    Archived t_7625b71f
     status now: archived
     events:
       created: {"assignee": "ibf-coder", "status": "ready", "parents": [], "creator_task_id": null, "tenant": null, "workspace_kind": "scratch", "workspace_path": null, "branch_name": null, "project_id": null, "skills": null, "goal_mode": null, "model_override": null, "provider_override": null}
-      claimed: {"lock": "otherhost:worker", "expires": 1789587683, "run_id": 1}
-      spawned: {"pid": 11876}
-      archive_refused: {"actor": "ibf-coder", "source": "cli", "force": false, "session_id": "20260916_214226_a9933b", "worker_pid": 11876, "claim_lock": "otherhost:worker", "host_local": false, "reason": "pid_alive", "heartbeat_age": null, "claim_expires": 1789586723}
+      claimed: {"lock": "otherhost:worker", "expires": 1789588075, "run_id": 1}
+      spawned: {"pid": 12368}
+      archive_refused: {"actor": "ibf-coder", "source": "cli", "force": false, "session_id": "20260916_214226_a9933b", "worker_pid": 12368, "claim_lock": "otherhost:worker", "host_local": false, "reason": "pid_alive", "heartbeat_age": null, "claim_expires": 1789587115}
       archived: {"actor": "ibf-coder", "source": "cli", "force": false, "session_id": "20260916_214226_a9933b"}
-      archive_worker_termination: {"prev_pid": 11876, "host_local": false, "termination_attempted": false, "terminated": false, "sigkill": false, "actor": "ibf-coder", "source": "cli", "force": false, "session_id": "20260916_214226_a9933b"}
+      archive_worker_termination: {"prev_pid": 12368, "host_local": false, "termination_attempted": false, "terminated": false, "sigkill": false, "actor": "ibf-coder", "source": "cli", "force": false, "session_id": "20260916_214226_a9933b"}
 
-[3] hermes kanban archive t_a1c3be19 t_d07eb37d  (one card live) -> rc=1
-    cannot archive t_d07eb37d: worker_pid 23916 is alive on this host (pid_alive, no heartbeat recorded); if it is not this card's worker, pass --force to terminate it and archive
+[3] hermes kanban archive t_05d67fa1 t_80e8a457  (one card live) -> rc=1
+    cannot archive t_80e8a457: worker_pid 3692 is alive on this host (pid_alive, no heartbeat recorded); if it is not this card's worker, pass --force to terminate it and archive
     live card:     running (kept running)
     finished card: done (untouched)

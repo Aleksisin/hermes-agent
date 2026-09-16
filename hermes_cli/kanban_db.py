@@ -3776,6 +3776,15 @@ def _live_run_from_row(row: sqlite3.Row) -> Optional[dict[str, Any]]:
     claim's worker), minus a heartbeat-only claim that has already expired — the dispatcher
     reclaims those as ordinary stuck cards, so the archive must not refuse what the tick will
     take anyway. Expiry is not a liveness signal here at all.
+
+    Declared limit (multi-host fleets): a row whose ``claim_expires`` is NULL never enters
+    ``release_stale_claims``' scan (its WHERE requires a non-NULL deadline), so such a claim is
+    never extended by the tick — and a FOREIGN claim with a fresh heartbeat and no live pid
+    answers ``None`` here, i.e. the archive judges it by the pid alone. On one host that is the
+    same row the dispatcher can see; across hosts it is the residual hole of this predicate: the
+    heartbeat is evidence, but this host cannot tell which machine wrote it, and only the pid
+    signal is host-checkable. Widening the heartbeat signal to foreign claims would fix it and
+    is a deliberate non-goal here (it changes what one host may archive on another host's word).
     """
     if row["status"] != "running":
         return None
