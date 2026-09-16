@@ -225,3 +225,140 @@ def test_severity_at_or_above_uses_threshold_semantics():
     assert kd.severity_at_or_above("error", "critical") is False
     assert kd.severity_at_or_above("mystery", "warning") is False
     assert kd.severity_at_or_above("warning", None) is True
+
+
+# ---------------------------------------------------------------------------
+# stranded_in_ready — the lane the dispatcher refused to spawn into (#21582)
+#
+# A card also sits ready past the threshold when its assignee's lane is at
+# ``kanban.max_in_progress_per_profile``: the tick defers it as
+# ``skipped_per_profile_capped`` and spawns it on the first free slot. That is
+# normal dispatch behaviour, not a broken assignee — so the rule names the cap,
+# the cards holding the lane and their ages instead of sending the operator to
+# hunt a typo and a dead worker pool.
+# ---------------------------------------------------------------------------
+
+
+def _write_lane_cap(kanban_home, cap):
+    """Put ``kanban.max_in_progress_per_profile`` in the profile's config file
+    (or remove it) — the single knob the dispatcher and the rule both read."""
+    path = kanban_home / "config.yaml"
+    if cap is None:
+        if path.exists():
+            path.unlink()
+        return
+    path.write_text(
+        f"""
+kanban:
+  max_in_progress_per_profile: {cap}
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+
+def _claimed(conn, title, assignee):
+    """Create + claim through the dispatcher's own claim path: a live run now
+    holds that profile's lane."""
+    task_id = kb.create_task(conn, title=title, assignee=assignee)
+    assert kb.claim_task(conn, task_id) is not None
+    return task_id
+
+
+def _stranded_diags(conn, task_id, *, now):
+    """Diagnostics for one task exactly as the CLI/dashboard compute them: the
+    runtime config from ``kanban.*`` plus the live lane snapshot."""
+    from hermes_cli.config import load_config
+
+    cfg = dict(kd.config_from_runtime_config(load_config()))
+    cfg["lane_state"] = kd.lane_saturation_snapshot(conn, now=now)
+    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    events = list(conn.execute(
+        "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (task_id,)))
+    runs = list(conn.execute(
+        "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (task_id,)))
+    diags = kd.compute_task_diagnostics(row, events, runs, now=now, config=cfg)
+    return [d for d in diags if d.kind == "stranded_in_ready"]
+
+
+def test_stranded_names_saturated_lane_and_holders(kanban_home):
+    """cap=2, two live runs of the assignee, a third card past the threshold →
+    the text names the saturation and both holders (ids + ages), and drops the
+    three generic causes it would otherwise guess from."""
+    _write_lane_cap(kanban_home, 2)
+    conn = kbc.connect()
+    try:
+        holders = [_claimed(conn, f"lane holder {i}", "ibf-coder") for i in range(2)]
+        # Distinct start times, so "oldest holder first" is a real contract and not
+        # a tie between two cards created inside the same second (which the payload
+        # would then order by task id).
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET started_at = started_at - 600 WHERE id = ?",
+                         (holders[0],))
+        waiting = kb.create_task(conn, title="waiting", assignee="ibf-coder")
+        now = int(time.time()) + 45 * 60
+        stranded = _stranded_diags(conn, waiting, now=now)
+    finally:
+        conn.close()
+
+    assert len(stranded) == 1
+    d = stranded[0]
+    assert d.data["lane_capped"] is True
+    assert d.data["lane_cap"] == 2
+    assert d.data["lane_running"] == 2
+    # Oldest first, with the backdated holder ahead by the 600s we removed.
+    assert [h["id"] for h in d.data["lane_holders"]] == holders
+    assert (d.data["lane_holders"][0]["age_seconds"]
+            - d.data["lane_holders"][1]["age_seconds"]) >= 600
+    # The holders have been running for the whole 45 min the card has waited.
+    assert all(h["age_seconds"] > 30 * 60 for h in d.data["lane_holders"])
+    for holder_id in holders:
+        assert holder_id in d.detail
+    assert "max_in_progress_per_profile" in d.detail
+    # The generic causes are for a FREE lane — not this one.
+    assert "misspelled" not in d.detail
+    assert "Common causes" not in d.detail
+
+
+def test_stranded_free_lane_keeps_generic_causes(kanban_home):
+    """Negative control: cap=2 but only ONE holder of this profile (the second
+    live run belongs to another profile) → the lane is free, so the three
+    original causes survive word for word."""
+    _write_lane_cap(kanban_home, 2)
+    conn = kbc.connect()
+    try:
+        _claimed(conn, "holder", "ibf-coder")
+        _claimed(conn, "other lane", "other-profile")
+        waiting = kb.create_task(conn, title="waiting", assignee="ibf-coder")
+        now = int(time.time()) + 45 * 60
+        stranded = _stranded_diags(conn, waiting, now=now)
+    finally:
+        conn.close()
+
+    assert len(stranded) == 1
+    d = stranded[0]
+    assert not d.data.get("lane_capped")
+    assert "misspelled" in d.detail
+    assert "profile was deleted" in d.detail
+    assert "external worker pool" in d.detail
+
+
+def test_lane_snapshot_is_empty_without_a_cap(kanban_home):
+    """No ``kanban.max_in_progress_per_profile`` → no lane signal at all: the
+    dispatcher defers nothing without a cap, so a busy lane cannot explain a
+    stranded card and the generic causes stay in charge."""
+    _write_lane_cap(kanban_home, None)
+    conn = kbc.connect()
+    try:
+        _claimed(conn, "holder", "ibf-coder")
+        _claimed(conn, "holder 2", "ibf-coder")
+        assert kd.lane_saturation_snapshot(conn) == {}
+        waiting = kb.create_task(conn, title="waiting", assignee="ibf-coder")
+        now = int(time.time()) + 45 * 60
+        stranded = _stranded_diags(conn, waiting, now=now)
+    finally:
+        conn.close()
+
+    assert len(stranded) == 1
+    d = stranded[0]
+    assert not d.data.get("lane_capped")
+    assert "misspelled" in d.detail
