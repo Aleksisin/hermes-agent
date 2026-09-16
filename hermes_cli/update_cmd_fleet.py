@@ -28,6 +28,11 @@ _FLEET_RESTART_PENDING_NAME = "fleet_restart_pending"
 
 _FRESH_RESTART_SUPERVISORS = frozenset({"systemd", "launchd", "service", "s6"})
 
+# Runtime kinds the gateway fleet matrix can never vouch for: its rows come from
+# gateway_state.json / the gateway control socket, so a serve/dashboard record has no
+# successor row and no gateway restart could ever discharge it. Named explicitly instead.
+_NON_GATEWAY_RUNTIME_KINDS = frozenset({"serve", "dashboard"})
+
 _SYSTEMD_SCOPES = (("user", ["systemctl", "--user"]), ("system", ["systemctl"]))
 _LIST_GATEWAY_UNITS = ["list-units", "hermes-gateway*", "hermes-serve*", "--plain", "--no-legend", "--no-pager"]
 
@@ -142,12 +147,61 @@ def _receipt_reports_stale_runtime(expected_sha: str | None = None) -> bool:
     )
 
 
-def _live_fleet_covers_receipt(expected_sha: str | None) -> bool:
-    """Require current successors for every recorded runtime, not just any live row.
+def _receipt_runtime_records(receipt: dict) -> list[tuple[object, str | None]]:
+    """``(record, default_kind)`` for every runtime ``latest.json`` recorded.
 
-    A PID changes on restart; the stable identity is (runtime kind, profile).
-    The gateway matrix cannot vouch for serve/dashboard or unidentified runtimes.
-    Keep the historical receipt intact: a manual restart is not a successful update.
+    ``plan.runtimes`` stamps an explicit ``kind``; a ``fleet`` matrix row is a gateway
+    by construction, so it defaults to ``"gateway"``.
+    """
+    plan = receipt.get("plan")
+    runtimes = plan.get("runtimes") if isinstance(plan, dict) else None
+    records: list[tuple[object, str | None]] = [(entry, None) for entry in (runtimes or [])]
+    fleet = receipt.get("fleet")
+    records.extend((entry, "gateway") for entry in (fleet if isinstance(fleet, list) else []))
+    return records
+
+
+def _unverifiable_fleet_receipt_runtimes(receipt: dict | None = None) -> list[str]:
+    """Names of recorded runtimes the gateway fleet matrix cannot vouch for.
+
+    The matrix is built from ``gateway_state.json`` and the gateway control socket, so a
+    serve/dashboard record has no successor row to match: no restart of the gateway fleet,
+    manual or automatic, can ever discharge it. Such a record is therefore not an
+    obligation — but it is not verified either, so it is named here instead of being
+    dropped silently. ``hermes update`` reports the same class itself through
+    ``_surviving_pre_update_serve_runtimes``.
+    """
+    if receipt is None:
+        try:
+            from hermes_cli.update_receipt import read_latest_receipt
+            receipt = read_latest_receipt() or {}
+        except Exception:
+            return []
+    names: list[str] = []
+    for entry, default_kind in _receipt_runtime_records(receipt):
+        if not isinstance(entry, dict):
+            names.append("an unreadable runtime record")
+            continue
+        kind = entry.get("kind", default_kind)
+        if kind not in _NON_GATEWAY_RUNTIME_KINDS:
+            continue
+        label = f"{kind} [{entry.get('profile') or 'unknown'}]"
+        pid = entry.get("pid")
+        names.append(f"{label} pid {pid}" if pid is not None else label)
+    return names
+
+
+def _live_fleet_covers_receipt(expected_sha: str | None) -> bool:
+    """Require current successors for every recorded runtime this matrix CAN vouch for.
+
+    A PID changes on restart; the stable identity is (runtime kind, profile). The matrix
+    covers gateways only — it is built from gateway state files and the control socket —
+    so a serve/dashboard record must not hold the obligation open forever: nothing could
+    ever discharge it, which is exactly how a *settled* fleet kept warning on every CLI
+    invocation. Those records are named by :func:`_unverifiable_fleet_receipt_runtimes`
+    instead (measured 2026-09-16). A gateway record still on the old sha without a live
+    successor keeps returning False: that is the case this warning exists for. Keep the
+    historical receipt intact: a manual restart is not a successful update.
     """
     if not expected_sha:
         return False
@@ -155,22 +209,23 @@ def _live_fleet_covers_receipt(expected_sha: str | None) -> bool:
 
     try:
         receipt = read_latest_receipt() or {}
-        plan = receipt.get("plan") or {}
-        runtimes = plan.get("runtimes") or []
-        recorded_fleet = receipt.get("fleet") or []
         owed = set()
-        entries: list[tuple[object, str | None]] = [(entry, None) for entry in runtimes]
-        entries.extend((entry, "gateway") for entry in recorded_fleet)
-        for entry, default_kind in entries:
+        for entry, default_kind in _receipt_runtime_records(receipt):
             if not isinstance(entry, dict):
                 return False
+            # Unverifiable here: disclosed by name, never owed.
+            if entry.get("kind", default_kind) in _NON_GATEWAY_RUNTIME_KINDS:
+                continue
             kind = entry.get("kind", default_kind)
             profile = entry.get("profile")
+            # Anything this matrix cannot identify (an unknown kind, a gateway with no
+            # usable profile) must not silently settle: fail closed, as before.
             if kind != "gateway" or not profile or profile == "unknown":
                 return False
             owed.add((kind, profile))
         if not owed:
-            return False
+            # Nothing gateway-shaped on record — a gateway restart owes nothing here.
+            return True
         fleet = collect_fleet_versions()
         if not fleet or any(
             row.get("state") != "current" or row.get("code_sha") != expected_sha
@@ -202,6 +257,11 @@ def _warn_pending_fleet_restart(*, startup: bool = False) -> None:
     stream = sys.stderr if startup else sys.stdout
     print("⚠ A previous `hermes update` pulled new code but did not restart running gateways.", file=stream)
     print("  Gateways may still be serving pre-update modules (mixed sys.modules).", file=stream)
+    # Say what the matrix cannot vouch for instead of letting it read as verified: a
+    # serve/dashboard record is neither owed nor checked here.
+    unverifiable = _unverifiable_fleet_receipt_runtimes()
+    if unverifiable:
+        print(f"  Not verified by this check: {', '.join(unverifiable)}.", file=stream)
     if startup:
         print("  Run `hermes update` or `hermes gateway restart`.", file=stream)
 

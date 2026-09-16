@@ -609,3 +609,176 @@ def test_startup_warn_silent_when_nothing_pending(capsys):
     captured = capsys.readouterr()
     assert captured.err == ""
     assert captured.out == ""
+
+
+# ---------------------------------------------------------------------------
+# Unverifiable (non-gateway) receipt records must not hold the obligation open
+# ---------------------------------------------------------------------------
+
+
+def _write_latest_receipt(payload: dict) -> None:
+    receipt_dir = get_hermes_home() / "logs" / "update_receipts"
+    receipt_dir.mkdir(parents=True, exist_ok=True)
+    (receipt_dir / "latest.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _measured_receipt(disk_sha: str, old_sha: str, *, gateway_profile: str = "default") -> dict:
+    """The measured 2026-09-16 interval: a pre-pull gateway AND a desktop serve."""
+    return {
+        "exit_code": 1,
+        "outcome": "failed",
+        "stop_reason": "KeyboardInterrupt: ",
+        "plan": {
+            "expected_sha": disk_sha,
+            "runtimes": [
+                {"kind": "gateway", "profile": gateway_profile, "pid": 24800, "code_sha": old_sha},
+                {"kind": "serve", "profile": "default", "pid": 17916, "supervisor": "desktop"},
+            ],
+        },
+    }
+
+
+def _patch_current_sha(monkeypatch, disk_sha: str) -> None:
+    monkeypatch.setattr(update_cmd, "_current_checkout_sha", lambda: disk_sha)
+    monkeypatch.setattr(update_cmd_fleet, "_current_checkout_sha", lambda: disk_sha)
+
+
+def test_serve_record_does_not_hold_the_gateway_obligation_open(monkeypatch):
+    """The gateway obligation is discharged once every GATEWAY record is covered.
+
+    The fleet matrix is built from ``gateway_state.json``/the gateway control
+    socket, so a serve/dashboard record has no successor row and no restart —
+    manual or automatic — can ever discharge it. Answering False on sight of one
+    kept the warning on every CLI invocation (measured 2026-09-16) although the
+    live gateway already served the current sha.
+    """
+    disk_sha, old_sha = "e" * 40, "7" * 40
+    _patch_current_sha(monkeypatch, disk_sha)
+    monkeypatch.setattr(
+        "hermes_cli.update_receipt.collect_fleet_versions",
+        lambda **k: [
+            {
+                "profile": "default",
+                "pid": 27176,
+                "code_sha": disk_sha,
+                "state": "current",
+                "source": "socket",
+            }
+        ],
+    )
+    _write_latest_receipt(_measured_receipt(disk_sha, old_sha))
+
+    assert update_cmd_fleet._pending_fleet_restart_needed() is False
+
+
+def test_serve_record_settles_without_a_startup_line(monkeypatch, capsys):
+    """A settled obligation stays silent — the unverifiable serve must not become
+    the next per-invocation line. ``hermes update`` names that class itself
+    (``_warn_stale_serve_runtimes``), and the warning names it whenever a gateway
+    obligation genuinely remains (next cell)."""
+    disk_sha, old_sha = "e" * 40, "7" * 40
+    _patch_current_sha(monkeypatch, disk_sha)
+    monkeypatch.setattr(
+        "hermes_cli.update_receipt.collect_fleet_versions",
+        lambda **k: [
+            {"profile": "default", "pid": 27176, "code_sha": disk_sha, "state": "current"}
+        ],
+    )
+    _write_latest_receipt(_measured_receipt(disk_sha, old_sha))
+
+    update_cmd._warn_pending_fleet_restart_on_startup()
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == ""
+
+
+def test_gateway_record_without_live_successor_still_warns(monkeypatch):
+    """Control for the cell above: same receipt, no live gateway successor."""
+    disk_sha, old_sha = "e" * 40, "7" * 40
+    _patch_current_sha(monkeypatch, disk_sha)
+    monkeypatch.setattr("hermes_cli.update_receipt.collect_fleet_versions", lambda **k: [])
+    _write_latest_receipt(_measured_receipt(disk_sha, old_sha))
+
+    assert update_cmd_fleet._pending_fleet_restart_needed() is True
+
+
+def test_marker_still_wins_over_a_settled_receipt(monkeypatch):
+    """The marker branch stays strict: it carries no runtime inventory, and an
+    older receipt cannot discharge an unknown, newer obligation."""
+    disk_sha, old_sha = "e" * 40, "7" * 40
+    _patch_current_sha(monkeypatch, disk_sha)
+    monkeypatch.setattr(
+        "hermes_cli.update_receipt.collect_fleet_versions",
+        lambda **k: [
+            {"profile": "default", "pid": 27176, "code_sha": disk_sha, "state": "current"}
+        ],
+    )
+    _write_latest_receipt(_measured_receipt(disk_sha, old_sha))
+    update_cmd._write_fleet_restart_pending_marker(expected_sha=disk_sha)
+
+    assert update_cmd_fleet._pending_fleet_restart_needed() is True
+
+
+def test_serve_only_receipt_owes_no_gateway_restart(monkeypatch):
+    """The same false alarm one step further: a plan that recorded no gateway at all.
+
+    A serve/dashboard record can carry a pre-pull ``code_sha`` (``RuntimeRecord`` does),
+    so it alone can raise the stale-runtime signal — yet no gateway shape is owed, and
+    the warning text would be describing runtimes that do not exist.
+    """
+    disk_sha, old_sha = "e" * 40, "7" * 40
+    _patch_current_sha(monkeypatch, disk_sha)
+    _write_latest_receipt(
+        {
+            "exit_code": 1,
+            "outcome": "failed",
+            "stop_reason": "KeyboardInterrupt: ",
+            "plan": {
+                "expected_sha": old_sha,
+                "runtimes": [
+                    {
+                        "kind": "serve",
+                        "profile": "default",
+                        "pid": 17916,
+                        "supervisor": "desktop",
+                        "code_sha": old_sha,
+                    }
+                ],
+            },
+        }
+    )
+
+    assert update_cmd_fleet._pending_fleet_restart_needed() is False
+
+
+def test_unverifiable_runtime_records_are_named_not_dropped(monkeypatch):
+    """Unverifiable records are disclosed by name — not silently ignored."""
+    disk_sha, old_sha = "e" * 40, "7" * 40
+    _write_latest_receipt(_measured_receipt(disk_sha, old_sha))
+
+    assert update_cmd_fleet._unverifiable_fleet_receipt_runtimes() == [
+        "serve [default] pid 17916"
+    ]
+
+
+def test_remaining_gateway_obligation_names_the_unverifiable_runtime(monkeypatch, capsys):
+    """Both halves of the contract in one warning: the uncovered gateway keeps the
+    alarm, and the serve record is named so it never reads as verified."""
+    disk_sha, old_sha = "e" * 40, "7" * 40
+    _patch_current_sha(monkeypatch, disk_sha)
+    monkeypatch.setattr(
+        "hermes_cli.update_receipt.collect_fleet_versions",
+        lambda **k: [
+            {"profile": "alpha", "pid": 2, "code_sha": disk_sha, "state": "current"}
+        ],
+    )
+    _write_latest_receipt(_measured_receipt(disk_sha, old_sha, gateway_profile="beta"))
+
+    assert update_cmd_fleet._pending_fleet_restart_needed() is True
+
+    update_cmd._warn_pending_fleet_restart_on_startup()
+
+    err = capsys.readouterr().err
+    assert "did not restart running gateways" in err
+    assert "Not verified by this check: serve [default] pid 17916." in err

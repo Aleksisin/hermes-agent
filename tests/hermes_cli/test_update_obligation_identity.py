@@ -47,7 +47,6 @@ def test_current_successors_settle_historical_obligations(monkeypatch, profiles)
         "down",
         "stale",
         "wrong-sha",
-        "wrong-kind",
         "unknown-profile",
         "marker",
     ],
@@ -59,8 +58,6 @@ def test_every_owed_identity_requires_current_evidence(monkeypatch, bad):
     if bad == "marker":
         (home / "fleet_restart_pending").write_text("expected_sha=new\n")
     owed = {"kind": "gateway", "profile": "beta", "code_sha": "old"}
-    if bad == "wrong-kind":
-        owed["kind"] = "serve"
     if bad == "unknown-profile":
         owed["profile"] = "unknown"
     (directory / "latest.json").write_text(
@@ -84,3 +81,31 @@ def test_every_owed_identity_requires_current_evidence(monkeypatch, bad):
     monkeypatch.setattr(update_cmd, "_current_checkout_sha", lambda: "new")
     monkeypatch.setattr(update_receipt, "collect_fleet_versions", lambda: rows)
     assert update_cmd_fleet._pending_fleet_restart_needed()
+
+
+def test_non_gateway_record_is_unverifiable_not_owed(monkeypatch):
+    """A serve/dashboard record is not an owed identity: the gateway matrix has no
+    successor row for it, so no restart of the gateway fleet could discharge it and
+    holding the warning open forever is a false alarm. It is disclosed by name."""
+    home = get_hermes_home()
+    directory = home / "logs" / "update_receipts"
+    directory.mkdir(parents=True)
+    (directory / "latest.json").write_text(
+        json.dumps({
+            "outcome": "failed",
+            "plan": {
+                "runtimes": [
+                    {"kind": "gateway", "profile": "alpha", "code_sha": "old"},
+                    {"kind": "serve", "profile": "beta", "pid": 17916, "code_sha": "old"},
+                ]
+            },
+        })
+    )
+    monkeypatch.setattr(update_cmd, "_current_checkout_sha", lambda: "new")
+    monkeypatch.setattr(
+        update_receipt,
+        "collect_fleet_versions",
+        lambda: [{"profile": "alpha", "state": "current", "code_sha": "new"}],
+    )
+    assert not update_cmd_fleet._pending_fleet_restart_needed()
+    assert update_cmd_fleet._unverifiable_fleet_receipt_runtimes() == ["serve [beta] pid 17916"]
