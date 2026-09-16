@@ -316,10 +316,17 @@ in one command:
 
 ```bash
 hermes kanban complete t_abc t_def t_hij --result "batch wrap"
-hermes kanban archive  t_abc t_def t_hij
+hermes kanban archive  t_abc t_def t_hij          # refuses the whole batch if any card is still running
 hermes kanban unblock  t_abc t_def
 hermes kanban block    t_abc "need input" --ids t_def t_hij
 ```
+
+`archive` asks before it touches anything: a card whose run is still live (its worker pid answers,
+or a heartbeat this host wrote is inside the stale window) is refused with `archive_refused`, and
+for a batch **no** card is archived when one is refused. `--force` is the operator's one override
+for the call — it archives anyway and terminates the worker; the `archived` event records
+`force: true`, so a terminated worker is never read as a silent archive. `--rm <ids>` purges
+already-archived cards and takes no `--force` (it names the flag if you pass it).
 
 :::note Where an unblocked task lands
 `unblock` restores the safe source phase: **`review`** for reviewer-origin work
@@ -839,7 +846,7 @@ hermes kanban comment <id> "<text>" [--author NAME]
 hermes kanban complete <id>... [--result "..."]
 hermes kanban block <id> "<reason>" [--ids <id>...]
 hermes kanban unblock <id>...
-hermes kanban archive <id>...
+hermes kanban archive <id>... [--force] [--rm <archived-id>...]
 
 hermes kanban request-review <id> [--summary "..."] [--metadata JSON] [--reviewer PROFILE]
 hermes kanban request-changes <id> "<required changes>"               # active reviewer -> implementer
@@ -873,6 +880,16 @@ hermes kanban gc [--event-retention-days N]            # workspaces + old events
 All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below).
 
 `--max-retries` is a per-task circuit-breaker override for the dispatcher. `--max-retries 1` blocks the task on the first non-successful attempt, while `--max-retries 3` allows two retries and blocks on the third failure. Omit it to use `kanban.failure_limit` from `config.yaml`, then the built-in default.
+
+**A long card and the breaker.** The counter counts *consecutive* failures of any kind (`crashed`,
+`timed_out`, `spawn_failed`) and only `complete_task` resets it, so a multi-hour card that crashed
+once in the middle sits at `1` — and one more crash would auto-block it for a human. Nothing
+distinguishes a long healthy run from a short one in that count, so state the budget at creation:
+`max_retries` for the failure budget and `max_runtime_seconds` as the per-attempt cap the
+dispatcher enforces. Raising `kanban.failure_limit` is the fleet-wide version of the same choice,
+paid for by every short card whose profile is misconfigured (it then takes that many failed spawns
+to block). `hermes kanban show <id>` prints the effective threshold (`task`, `config` or `default`)
+so the budget is visible before the crash, not after.
 
 ### Concurrency, scheduling, and child promotion config
 
@@ -1256,7 +1273,8 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `dependency_wait` | `{reason, kind}` | Worker blocked with `kind=dependency` — the task is only waiting on another task, so it routes to `todo` (parent-gated, auto-promoted) instead of `blocked`. No human needed. |
 | `block_loop_detected` | `{reason, kind, recurrences, limit}` | A task was unblocked and re-blocked for the same reason `BLOCK_RECURRENCE_LIMIT` times (default 2). Instead of landing in `blocked` again — where a cron would keep unblocking it — it routes to `triage` for a human decision, breaking the unblock↔re-block loop. |
 | `unblocked` | — | `blocked → ready` (or `todo` if parents are still open), either manually or via `/unblock`. Resets the dispatcher's `consecutive_failures` but deliberately preserves `block_recurrences` so the loop breaker keeps its memory. `run_id` is `NULL`. |
-| `archived` | — | Hidden from the default board. If the task was still running, carries the `run_id` of the run that was reclaimed as a side effect. |
+| `archived` | — | Hidden from the default board. Carries the initiator (`{actor, source, session_id?, force}`) so a cleanup that took live work down can be attributed afterwards; `force: true` means the archive overrode the live-run guard. If the task was still running, carries the `run_id` of the run that was reclaimed as a side effect. |
+| `archive_refused` | `{actor, source, session_id?, force, worker_pid, claim_lock, host_local, reason, heartbeat_age, claim_expires}` | `hermes kanban archive` (or the dashboard) refused to archive a card whose run is still live, without `--force`. `reason` is `pid_alive` or `fresh_heartbeat`; `host_local` says whether that pid is one this host can signal (a live pid under another host's claim refuses too — a reused pid cannot be told from a real worker at this layer). For a batch, the whole id list is asked before the first card is archived, so a refusal means **nothing** in the batch was archived. |
 
 **Edits** (human-driven changes that aren't transitions):
 

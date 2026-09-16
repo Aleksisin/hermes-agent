@@ -339,9 +339,13 @@ _SPECS = [
     _cmd("archive", [
         _arg("task_ids", nargs="*", help="Task ids to archive (default mode)"),
         _arg("--force", action="store_true",
-             help="Archive even when the card's run is still live (terminates its worker)"),
+             help="Archive even when the card's run is still live (terminates its worker). "
+                  "Refused archives are recorded as an 'archive_refused' event naming the "
+                  "worker pid; the successful archive records 'force' in its own event."),
         _arg("--rm", dest="purge_ids", nargs="+",
-             help="Permanently delete already-archived task ids from the board"),
+             help="Permanently delete already-archived task ids from the board. Takes no "
+                  "--force: a purge has no live-run guard to override, and a card must "
+                  "already be archived."),
     ], help="Archive one or more tasks"),
     _cmd("tail", [_TASK_ID, _arg("--interval", type=float, default=1.0)], help="Follow a task's event stream"),
     _cmd("dispatch", [
