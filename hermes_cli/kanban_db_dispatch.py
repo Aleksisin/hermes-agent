@@ -1342,6 +1342,38 @@ def configured_max_in_progress() -> Optional[int]:
     return ival if ival >= 1 else None
 
 
+def configured_max_in_progress_per_profile() -> Optional[int]:
+    """Read ``kanban.max_in_progress_per_profile`` from config, or None when
+    unset/invalid. Sibling of :func:`configured_max_in_progress` and normalized
+    through the same :func:`_positive_int` as every dispatch entry point, so the
+    ``stranded_in_ready`` diagnostic names the exact cap the tick enforces (#21582).
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get("max_in_progress_per_profile")
+    except Exception:
+        return None
+    return _positive_int(raw, None)
+
+
+def running_rows_by_assignee(conn: sqlite3.Connection) -> dict[str, list[sqlite3.Row]]:
+    """Live ``running`` cards grouped by assignee, oldest first.
+
+    The ONE answer to "who holds a lane right now": the tick's per-profile cap
+    counts these rows and ``kanban_diagnostics.lane_saturation_snapshot`` lists
+    them as the lane holders, so the diagnostic and the dispatcher cannot drift
+    apart on who is holding the slot (#21582).
+    """
+    by_assignee: dict[str, list[sqlite3.Row]] = {}
+    for row in conn.execute(
+        "SELECT id, assignee, created_at, started_at FROM tasks "
+        "WHERE status = 'running' AND assignee IS NOT NULL "
+        "ORDER BY assignee, created_at, id"
+    ):
+        by_assignee.setdefault(row["assignee"], []).append(row)
+    return by_assignee
+
+
 def count_running_tasks(conn: sqlite3.Connection) -> int:
     """Number of tasks in ``status='running'``.
 
@@ -1801,12 +1833,9 @@ def _dispatch_once_locked(
     ) else None
     per_profile_running: dict[str, int] = {}
     if per_profile_cap is not None:
-        for prow in conn.execute(
-            "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
-            "GROUP BY assignee"
-        ):
-            per_profile_running[prow["assignee"]] = int(prow["n"])
+        per_profile_running = {
+            assignee: len(rows) for assignee, rows in running_rows_by_assignee(conn).items()
+        }
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,

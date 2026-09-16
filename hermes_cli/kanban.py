@@ -475,6 +475,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if rc:
         return rc
     graph = None
+    lane_state: dict = {}
     want_json = getattr(args, "json", False)
     with kbc.connect_closing() as conn:
         task = kb.get_task(conn, args.task_id)
@@ -489,6 +490,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
         latest_summary = kb.latest_summary(conn, args.task_id)
         if not want_json:
             graph = kb.task_graph_context(conn, task.id)
+            # Live lane state (the dispatcher's cap over the cards it counts as
+            # holders) so a deferred card explains itself instead of looking stranded.
+            from hermes_cli import kanban_diagnostics as kd
+            lane_state = kd.lane_saturation_snapshot(conn)
 
     if want_json:
         _print_json({
@@ -527,8 +532,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     field("created", f"{_fmt_ts(task.created_at)} by {task.created_by or '-'}")
 
     # Diagnostics up top so CLI users see distress signals before scrolling.
-    from hermes_cli import kanban_diagnostics as kd
-    diags = kd.compute_task_diagnostics(task, events, runs, graph=graph)
+    diags = kd.compute_task_diagnostics(task, events, runs, graph=graph,
+                                        config={"lane_state": lane_state})
     if diags:
         print(f"\n  Diagnostics ({len(diags)}):")
         _print_diagnostics(diags, "    ", with_kind=False)
@@ -638,6 +643,10 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     diag_config = kd.config_from_runtime_config(load_config())
 
     with kbc.connect_closing() as conn:
+        # Live lane state for the whole board: the dispatcher's per-profile cap over
+        # the cards it counts as holders, so a card the tick deferred as
+        # skipped_per_profile_capped explains itself instead of looking stranded.
+        diag_config = {**diag_config, "lane_state": kd.lane_saturation_snapshot(conn)}
         # Either one-task mode or fleet mode.
         if getattr(args, "task", None):
             task = kb.get_task(conn, args.task)

@@ -621,12 +621,74 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
     )]
 
 
+def _age_str(seconds: float) -> str:
+    """``62m`` / ``3.1h`` — compact age for titles and holder lists."""
+    if seconds >= 3600:
+        return f"{seconds / 3600:.1f}h"
+    return f"{int(seconds / 60)}m"
+
+
+def lane_saturation_snapshot(conn, *, now: Optional[int] = None) -> dict[str, dict]:
+    """Per-assignee lane state — the dispatcher's own cap over its own holders.
+
+    The cap is ``kanban_db_dispatch.configured_max_in_progress_per_profile`` and
+    the holders are ``kanban_db_dispatch.running_rows_by_assignee``, the query
+    the tick's per-profile guard counts, so ``stranded_in_ready`` names the
+    saturation the dispatcher actually acted on instead of re-deriving
+    ``kanban.max_in_progress_per_profile`` (#21582).
+
+    ``{}`` when no cap is configured: without one the tick defers nothing, so a
+    busy lane cannot explain a stranded card. Callers holding a connection pass
+    the result as ``cfg["lane_state"]``.
+    """
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    cap = kbd.configured_max_in_progress_per_profile()
+    if cap is None:
+        return {}
+    now_ts = int(now if now is not None else time.time())
+    snapshot: dict[str, dict] = {}
+    for assignee, rows in kbd.running_rows_by_assignee(conn).items():
+        holders = sorted(
+            (
+                {
+                    "id": _task_field(row, "id"),
+                    "age_seconds": max(
+                        0,
+                        now_ts - int(_task_field(row, "started_at", None)
+                                     or _task_field(row, "created_at", 0) or 0),
+                    ),
+                }
+                for row in rows
+            ),
+            key=lambda h: -h["age_seconds"],
+        )
+        snapshot[assignee] = {
+            "cap": cap,
+            "running": len(rows),
+            # The guard's own comparison: `cap` live cards is what makes the tick
+            # record ``skipped_per_profile_capped`` for the next ready card.
+            "capped": len(rows) >= cap,
+            "holders": holders,
+        }
+    return snapshot
+
+
 def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Assigned, unclaimed, ``ready`` for >= cfg["stranded_threshold_seconds"]
-    (default 30 min). Deliberately age-based and identity-agnostic so it
-    catches typo'd assignees, deleted profiles, and down external worker
-    pools alike without a registry to curate. Unassigned tasks are excluded —
-    the dispatcher's ``skipped_unassigned`` already covers them."""
+    (default 30 min).
+
+    A saturated lane is checked BEFORE the generic causes: when the assignee
+    already holds its ``kanban.max_in_progress_per_profile`` slots (from
+    ``cfg["lane_state"]``, built by :func:`lane_saturation_snapshot`) the card is
+    deferred by design — the tick records ``skipped_per_profile_capped`` and
+    spawns it on a later tick — so the text names the cap and its holders rather
+    than sending the operator after a typo.
+
+    Otherwise the rule stays age-based and identity-agnostic, catching typo'd
+    assignees, deleted profiles, and down external worker pools alike without a
+    registry to curate. Unassigned tasks are excluded — the dispatcher's
+    ``skipped_unassigned`` already covers them."""
     threshold_seconds = float(cfg.get("stranded_threshold_seconds", 30 * 60))
     if _task_field(task, "status") != "ready":
         return []
@@ -650,7 +712,7 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     if age_seconds < threshold_seconds:
         return []
 
-    age_str = f"{age_seconds / 3600:.1f}h" if age_seconds >= 3600 else f"{int(age_seconds / 60)}m"
+    age_str = _age_str(age_seconds)
     # Escalate with age: <2x threshold warning, 2x-6x error, >6x critical.
     if age_seconds >= threshold_seconds * 6:
         severity = "critical"
@@ -658,6 +720,40 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
         severity = "error"
     else:
         severity = "warning"
+
+    base_data = {"ready_since": last_ready_ts, "age_seconds": int(age_seconds),
+                 "assignee": assignee, "threshold_seconds": int(threshold_seconds)}
+
+    lane = (cfg.get("lane_state") or {}).get(assignee) or {}
+    if lane.get("capped"):
+        cap = int(lane.get("cap") or 0)
+        running = int(lane.get("running") or 0)
+        holders = list(lane.get("holders") or [])
+        holders_str = ", ".join(
+            f"{h.get('id')} (running {_age_str(h.get('age_seconds') or 0)})" for h in holders
+        )
+        actions = [
+            _cli_hint("Confirm the lane cap: hermes kanban dispatch --dry-run --json",
+                      "hermes kanban dispatch --dry-run --json", suggested=True),
+        ]
+        if holders:
+            oldest_id = holders[0].get("id")
+            actions.append(_cli_hint(f"Inspect lane holder {oldest_id}: hermes kanban show {oldest_id}",
+                                     f"hermes kanban show {oldest_id}"))
+        return [Diagnostic(
+            kind="stranded_in_ready", severity=severity,
+            title=f"Ready for {age_str} — {assignee} lane at cap ({running}/{cap})",
+            detail=f"This task has been ready for {age_str} because the {assignee!r} lane is full: "
+                   f"{running} card(s) of this profile hold its "
+                   f"kanban.max_in_progress_per_profile={cap} slots — {holders_str}. The dispatcher "
+                   f"defers this card as skipped_per_profile_capped by design and spawns it on the "
+                   f"first tick after a slot frees; the assignee and its worker pool are fine. Wait "
+                   f"for a holder to finish, or raise kanban.max_in_progress_per_profile.",
+            actions=actions,
+            first_seen_at=last_ready_ts, last_seen_at=last_ready_ts, count=1,
+            data={**base_data, "lane_capped": True, "lane_cap": cap,
+                  "lane_running": running, "lane_holders": holders},
+        )]
 
     actions = [
         DiagnosticAction(kind="reassign", label="Reassign to a different worker",
@@ -673,8 +769,7 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
                f"actually polling for it.",
         actions=actions,
         first_seen_at=last_ready_ts, last_seen_at=last_ready_ts, count=1,
-        data={"ready_since": last_ready_ts, "age_seconds": int(age_seconds),
-              "assignee": assignee, "threshold_seconds": int(threshold_seconds)},
+        data={**base_data, "lane_capped": False},
     )]
 
 

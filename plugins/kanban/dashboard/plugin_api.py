@@ -202,6 +202,9 @@ def _compute_task_diagnostics(conn: sqlite3.Connection, task_ids: Optional[list[
     if task_ids is not None and not task_ids:
         return {}
     diag_config = kd.config_from_runtime_config(load_config())
+    # Lane state is board-wide (one query), not per task: the dispatcher's per-profile
+    # cap over the cards it counts as holders, so a deferred card names its lane.
+    diag_config["lane_state"] = kd.lane_saturation_snapshot(conn)
     if task_ids is not None:
         rows = conn.execute(f"SELECT * FROM tasks WHERE id IN ({_placeholders(task_ids)})", tuple(task_ids)).fetchall()
     else:
