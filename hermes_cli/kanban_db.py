@@ -2537,7 +2537,7 @@ def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
-    fire_lifecycle_hook: bool = True,
+    force: bool = False, fire_lifecycle_hook: bool = True,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2548,6 +2548,14 @@ def complete_task(
     ``created_cards`` are verified first — a phantom id raises
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
+
+    Ownership: a card that is ``running`` under a live claim may only be closed
+    by its holder — the caller proving the run (``expected_run_id``) or holding
+    the claim itself — unless ``force`` declares an explicit operator override
+    (the same band :func:`request_review` uses). An override is never silent: it
+    is recorded as a non-owner completion (:data:`NON_OWNER_CLOSE_EVENT` +
+    ``metadata[<NON_OWNER_CLOSE_KEY>]``), so the board can tell "the holder
+    closed it" from "somebody closed it past the holder".
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
@@ -2572,6 +2580,22 @@ def complete_task(
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
             return False
+        # Ownership, decided on the row the terminal UPDATE will CAS: a close
+        # without the owner's run must not steal a live claim (refused), and when
+        # it does go through it is recorded as a non-owner completion.
+        claim_row = conn.execute(
+            "SELECT status, claim_lock, claim_expires, worker_pid, current_run_id "
+            "FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        allowed, holder = _unowned_close_verdict(claim_row, expected_run_id, force)
+        if not allowed:
+            return False
+        # Only the override is recorded: a close by the holder itself (or one that
+        # proves the run) is the owner's own close and needs no second label.
+        if force and holder is not None and expected_run_id is None:
+            metadata = _annotate_non_owner_close(
+                metadata, _non_owner_close_record(holder, claim_row),
+            )
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
         prior_status = _task_status(conn, task_id)
@@ -2621,6 +2645,11 @@ def complete_task(
             _append_event(
                 conn, task_id, UNMERGED_BRANCH_EVENT,
                 metadata[UNMERGED_BRANCH_KEY], run_id=run_id,
+            )
+        if isinstance(metadata, dict) and isinstance(metadata.get(NON_OWNER_CLOSE_KEY), dict):
+            _append_event(
+                conn, task_id, NON_OWNER_CLOSE_EVENT,
+                metadata[NON_OWNER_CLOSE_KEY], run_id=run_id,
             )
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
     # Success wipes the breaker counter (history stays on the event log).
@@ -2714,7 +2743,112 @@ def _completed_event_payload(
         unmerged = metadata.get(UNMERGED_BRANCH_KEY)
         if isinstance(unmerged, dict):
             payload[UNMERGED_BRANCH_KEY] = unmerged
+        non_owner = metadata.get(NON_OWNER_CLOSE_KEY)
+        if isinstance(non_owner, dict):
+            payload[NON_OWNER_CLOSE_KEY] = non_owner
     return payload
+
+
+# Completion ownership: a card that is ``running`` under a live claim belongs to
+# that claim's holder, and a close that carries no proof of ownership must say so.
+# Observed 2026-09-16 (IBF board): a delegate_task child closed t_d1e09157 while
+# worker run 386 was still working — it dropped one env var, the CLI returned 0,
+# and the ``completed`` event carried the OWNER's run id, so the board could not
+# tell the two closes apart (the card read ``done`` 11.5 minutes before the
+# owner's own commit landed).
+NON_OWNER_CLOSE_KEY = "non_owner_completion"
+NON_OWNER_CLOSE_EVENT = "completion_non_owner"
+
+
+def _live_claim_holder(row) -> Optional[str]:
+    """``claim_lock`` of this task row's LIVE claim, or None when there is none.
+
+    "Live" = ``running`` under a lock whose lease has not lapsed. An expired
+    lease is the dispatcher's reclaim lane (:func:`release_stale_claims`), not an
+    ownership wall — refusing there would freeze a card nobody is working on.
+    A missing ``claim_expires`` counts as live: fail closed, and the caller's way
+    out (``force``) is one explicit line.
+    """
+    if row is None or row["status"] != "running":
+        return None
+    lock = row["claim_lock"]
+    if not lock:
+        return None
+    expires = row["claim_expires"]
+    if expires is not None and int(expires) < int(time.time()):
+        return None
+    return lock
+
+
+def _unowned_close_verdict(row, expected_run_id: Optional[int], force: bool) -> tuple[bool, Optional[str]]:
+    """``(allowed, holder_lock)`` for a close that carries no run proof.
+
+    ``expected_run_id`` is the ownership proof both owner paths already pass — the
+    worker tool (``tools/kanban_tools.py``) and the scoped CLI
+    (``hermes_cli/kanban.py::_worker_run_id_for``) — plus the compare-and-swap on
+    ``current_run_id`` it drives. A caller without it may only touch a card with
+    no live claim, or one it holds itself (the lock is this process's
+    ``host:pid``, ``hermes_cli/kanban_db.py::_claimer_id``), unless ``force``
+    declares an explicit operator override — the same band
+    :func:`request_review` uses to clear a live claim.
+
+    Returns the holder so the caller can record (or name) two different closes:
+    "the holder closed it" and "somebody overrode the holder".
+    """
+    holder = _live_claim_holder(row)
+    if holder is None or expected_run_id is not None:
+        return True, holder
+    return bool(force or holder == _claimer_id()), holder
+
+
+def _non_owner_close_record(holder: str, row) -> dict:
+    """The board's own account of a close that overrode a live claim's holder."""
+    run_id = _opt_int(row["current_run_id"]) if row["current_run_id"] is not None else None
+    return {
+        "holder": holder,
+        "claim_lock": holder,
+        "closed_by": _claimer_id(),
+        "caller_pid": os.getpid(),
+        "run_id": run_id,
+        "worker_pid": _opt_int(row["worker_pid"]) if row["worker_pid"] is not None else None,
+        "warning": (
+            f"card closed by an explicit override while {holder} held a live claim"
+            f"; the card's run {run_id} was still open"
+        ),
+    }
+
+
+def _annotate_non_owner_close(metadata: Optional[dict], record: dict) -> Optional[dict]:
+    """Add the non-owner close to the completion metadata (never removes a key)."""
+    updated = dict(metadata) if isinstance(metadata, dict) else {}
+    updated[NON_OWNER_CLOSE_KEY] = record
+    return updated
+
+
+def close_refusal_reason(
+    conn: sqlite3.Connection, task_id: str, *, expected_run_id: Optional[int] = None,
+) -> Optional[str]:
+    """Why this caller may not close ``task_id`` right now, or None when it may.
+
+    Read-only twin of :func:`complete_task`'s gate, for surfaces that must say WHY
+    a completion was refused: a bare "cannot complete" hid an ownership clash in
+    the observed case (the CLI printed nothing about the live claim). Reporting
+    only — the authority is ``complete_task``'s own in-transaction check.
+    """
+    row = conn.execute(
+        "SELECT status, claim_lock, claim_expires, worker_pid, current_run_id "
+        "FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    allowed, holder = _unowned_close_verdict(row, expected_run_id, False)
+    if allowed or holder is None:
+        return None
+    return (
+        f"{task_id} is running under a live claim held by {holder}: a close without the "
+        f"owner's run (expected_run_id) is refused. Let the holder finish, reclaim the claim, "
+        f"or pass --force to override the holder (the close is recorded as a non-owner completion)"
+    )
 
 
 # Completion merge verdict: a card may reach ``done`` while its branch was

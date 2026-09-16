@@ -1228,7 +1228,41 @@ def test_specify_happy_path(client, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Final result visibility for Done cards
+# A dashboard close of a claimed card is an explicit override — and it says so
 # ---------------------------------------------------------------------------
 
+
+def test_dashboard_close_override_is_recorded_as_a_non_owner_close(client):
+    """The panel is the operator's band over a live claim (the same ``force`` the
+    neighbouring ``review`` handler uses). The close must still go through — a human
+    closing a running card is legitimate — but it lands on the board as a non-owner
+    completion instead of looking like the holder's own close (the observed
+    2026-09-16 case: a card closed by a stranger, recorded under the owner's run).
+    """
+    tid = client.post("/api/plugins/kanban/tasks",
+                      json={"title": "running card", "assignee": "worker"}).json()["task"]["id"]
+    with kbc.connect_closing() as conn:
+        claim = kb.claim_task(conn, tid, claimer="someone-else:999")
+        assert claim is not None
+
+    r = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"status": "done", "result": "closed"})
+    assert r.status_code == 200, r.text
+    assert r.json()["task"]["status"] == "done"
+
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "done"
+        payloads = []
+        for event in kb.list_events(conn, tid):
+            if event.kind != kb.NON_OWNER_CLOSE_EVENT:
+                continue
+            payload = event.payload
+            payloads.append(json.loads(payload) if isinstance(payload, str) else payload)
+        assert payloads, "the panel's override must be distinguishable on the board"
+        assert payloads[-1]["holder"] == "someone-else:999"
+        assert payloads[-1]["run_id"] == claim.current_run_id
+
+
+# ---------------------------------------------------------------------------
+# Final result visibility for Done cards
+# ---------------------------------------------------------------------------
 

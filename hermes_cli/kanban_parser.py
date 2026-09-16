@@ -284,6 +284,10 @@ _SPECS = [
         _arg("--metadata",
              help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                   '"tests_run": 12}\'). Stored on the closing run.'),
+        _arg("--force", action="store_true",
+             help="Override the live-claim guard: close a card whose claim is held by "
+                  "another live run (an explicit operator override; the close is recorded "
+                  "as a non-owner completion)."),
     ], help="Mark one or more tasks done"),
     _cmd("edit", [
         _TASK_ID,
