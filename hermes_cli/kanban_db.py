@@ -2558,6 +2558,11 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    # Advisory merge verdict, read before any teardown can move refs: a card
+    # that closes with its branch unmerged must say so in its own report.
+    merge_state = _completion_merge_state(conn, task_id)
+    if merge_state and not _close_without_merge_declared(metadata):
+        metadata = _annotate_unmerged_branch(metadata, merge_state)
     handoff_summary = summary if summary is not None else result
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
@@ -2612,6 +2617,11 @@ def complete_task(
             _completed_event_payload(result, event_summary, verified_cards, metadata),
             run_id=run_id,
         )
+        if isinstance(metadata, dict) and isinstance(metadata.get(UNMERGED_BRANCH_KEY), dict):
+            _append_event(
+                conn, task_id, UNMERGED_BRANCH_EVENT,
+                metadata[UNMERGED_BRANCH_KEY], run_id=run_id,
+            )
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
     # Success wipes the breaker counter (history stays on the event log).
     _clear_failure_counter(conn, task_id)
@@ -2681,8 +2691,11 @@ def _completed_event_payload(
 ) -> dict:
     """``completed`` event payload: first summary line (400 chars) so gateway
     notifiers / dashboard WS render without a second round-trip; verified
-    cards; and ``metadata["artifacts"]`` promoted so the notifier can upload
-    them as native attachments without fetching the run row."""
+    cards; ``metadata["artifacts"]`` promoted so the notifier can upload
+    them as native attachments without fetching the run row; and the
+    ``unmerged_branch`` verdict, so a card that closed with its work still
+    unlanded says so on the board itself instead of only in a git command
+    someone has to think of running."""
     # Mirror CLI's _show_voice_status: include STT/TTS provider availability so the user can tell at a
     # glance *why* voice mode isn't working ("STT provider: MISSING ..." is the common case). ``record_key``
     # mirrors the configured ``voice.record_key`` so the TUI can both bind it (frontend
@@ -2698,7 +2711,79 @@ def _completed_event_payload(
         cleaned = _cleaned_artifact_paths(metadata)
         if cleaned:
             payload["artifacts"] = cleaned
+        unmerged = metadata.get(UNMERGED_BRANCH_KEY)
+        if isinstance(unmerged, dict):
+            payload[UNMERGED_BRANCH_KEY] = unmerged
     return payload
+
+
+# Completion merge verdict: a card may reach ``done`` while its branch was
+# never landed in the target tree (observed twice on the IBF board,
+# 2026-09-16 — each time found only by a hand-run ``git rev-list``).
+UNMERGED_BRANCH_KEY = "unmerged_branch"
+UNMERGED_BRANCH_EVENT = "completion_unmerged_branch"
+# Non-empty ``metadata[<key>]`` = the worker/human decided to close this card
+# without merging it; the reason is stored with the completion so the decision
+# is auditable instead of inferred from an empty warning.
+CLOSE_WITHOUT_MERGE_KEY = "close_without_merge"
+
+
+def _close_without_merge_declared(metadata: Any) -> bool:
+    """True when ``metadata`` carries a non-blank close-without-merge reason."""
+    if not isinstance(metadata, dict):
+        return False
+    reason = metadata.get(CLOSE_WITHOUT_MERGE_KEY)
+    return isinstance(reason, str) and bool(reason.strip())
+
+
+def _completion_merge_state(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """The card worktree's landing verdict, or None when nothing is checkable.
+
+    Advisory by construction: an unavailable answer (no worktree, no git, no
+    other branch to land in) is None, and the observation never blocks a
+    completion. See :func:`~hermes_cli.kanban_db_workspace._worktree_merge_state`.
+    """
+    try:
+        from hermes_cli.kanban_db_workspace import _worktree_merge_state
+
+        row = conn.execute(
+            "SELECT workspace_kind, workspace_path, branch_name FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row or row["workspace_kind"] != "worktree" or not row["workspace_path"]:
+            return None
+        return _worktree_merge_state(row["workspace_path"], row["branch_name"])
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
+def _annotate_unmerged_branch(metadata: Optional[dict], state: Optional[dict]) -> Optional[dict]:
+    """Add the merge warning to the completion metadata (never removes a key)."""
+    if not state:
+        return metadata
+    if state.get("unmerged_commits", 0) <= 0 and not state.get("dirty"):
+        return metadata
+    if _close_without_merge_declared(metadata):
+        return metadata
+    updated = dict(metadata) if isinstance(metadata, dict) else {}
+    branch = state.get("branch") or "(detached HEAD)"
+    commits = int(state.get("unmerged_commits") or 0)
+    dirty = bool(state.get("dirty"))
+    details = [f"{commits} commit(s) not reachable from another local branch"] if commits else []
+    if dirty:
+        details.append("uncommitted changes in the worktree")
+    updated[UNMERGED_BRANCH_KEY] = {
+        "branch": branch,
+        "unmerged_commits": commits,
+        "dirty": dirty,
+        "warning": (
+            f"card closed but its worktree {state.get('path')} still holds work: "
+            + "; ".join(details)
+            + f". Merge {branch} into the target tree, or declare "
+            f"metadata[{CLOSE_WITHOUT_MERGE_KEY!r}] with a reason."
+        ),
+    }
+    return updated
 
 
 def _flag_phantom_prose_refs(

@@ -368,6 +368,69 @@ def _git_current_branch(path: Path) -> Optional[str]:
     return _kb._git_out(path, "branch", "--show-current")
 
 
+def _local_branches(repo_root: Path) -> Optional[list[str]]:
+    """Short names of the repo's local branches, or None when git cannot say."""
+    out = _git(repo_root, "for-each-ref", "--format=%(refname:short)", "refs/heads", timeout=30)
+    if out.returncode != 0:
+        return None
+    return [line.strip() for line in (out.stdout or "").splitlines() if line.strip()]
+
+
+def _worktree_merge_state(path: str, branch_name: Optional[str] = None) -> Optional[dict]:
+    """Whether a finished task worktree still holds work that never landed.
+
+    Returns ``{"branch", "unmerged_commits", "dirty"}`` or ``None`` when the
+    question cannot be answered (not a linked worktree, no other local branch
+    to land in, the card works directly on the tree's own branch) — the caller
+    must treat ``None`` as "no verdict", never as "clean".
+
+    The landing targets are the repo's local branches minus the card's own:
+    the target tree is where merges happen locally, and a copy pushed to a
+    remote topic branch is deliberately NOT counted as landed. Work that is
+    intentionally not merged is declared by the caller, not inferred here.
+    """
+    try:
+        wp = Path(path).expanduser()
+        if not wp.is_dir():
+            return None
+        common = _git_common_dir(wp)
+        if common is None or common.name != ".git":
+            return None  # not a linked worktree of a normal repo — never guess
+        repo_root = common.parent
+        if wp.resolve(strict=False) == repo_root.resolve(strict=False):
+            return None  # the main checkout is not a card worktree
+        tip = _git_current_branch(wp) or (branch_name or "").strip() or "HEAD"
+        branches = _local_branches(repo_root)
+        if branches is None:
+            return None
+        targets = [name for name in branches if name != tip]
+        if not targets:
+            return None  # nothing to land in — the repo has only this branch
+        if tip in branches and tip == (_git_current_branch(repo_root) or ""):
+            return None  # the card works on the tree's own branch
+        counted = _git(
+            repo_root, "rev-list", "--count", tip, "--not", *targets, timeout=30,
+        )
+        if counted.returncode != 0:
+            return None
+        unmerged = int((counted.stdout or "0").strip() or 0)
+        dirty = False
+        try:
+            from hermes_cli.worktree_ops import _worktree_is_dirty
+
+            dirty = bool(_worktree_is_dirty(str(wp)))
+        except Exception:
+            dirty = False
+        return {
+            "branch": tip if tip != "HEAD" else None,
+            "unmerged_commits": unmerged,
+            "dirty": dirty,
+            "path": str(wp),
+        }
+    except Exception:
+        return None  # best-effort — a failed check never blocks a completion
+
+
 def _is_linked_worktree_checkout(path: Path) -> bool:
     git_dir = _git_dir(path)
     common_dir = _git_common_dir(path)
