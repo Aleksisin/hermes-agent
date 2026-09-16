@@ -95,9 +95,15 @@ def _commit_in(wt: Path, name: str, text: str = "work\n") -> None:
 
 
 def _start(conn, tid: str) -> None:
+    """Bring the card to ``running`` under a claim the closing process holds.
+
+    The claimer is deliberately this process: ``complete_task`` only accepts an
+    unowned close of a live-claimed card from that claim's holder (or with an
+    explicit ``force``), and these cells exercise a close, not an invasion.
+    """
     with kb.write_txn(conn):
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
-    assert kb.claim_task(conn, tid, claimer="worker") is not None
+    assert kb.claim_task(conn, tid) is not None
 
 
 def _completed_event(conn, tid: str) -> dict | None:
