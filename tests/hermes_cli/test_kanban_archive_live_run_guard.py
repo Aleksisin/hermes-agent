@@ -384,6 +384,8 @@ def test_batch_archives_nothing_when_one_card_is_live(kanban_home, monkeypatch, 
     with kbc.connect() as conn:
         assert kb.get_task(conn, finished).status == "done", "the batch archived nothing"
         assert kb.get_task(conn, live).status == "running"
+        kinds = _kinds(conn, live)
+        assert "archive_refused" in kinds, "the batch refusal is on the card's record too"
 
 
 def test_forced_batch_archives_every_id(kanban_home, monkeypatch, capsys):

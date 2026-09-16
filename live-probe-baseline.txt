@@ -1,0 +1,32 @@
+probe sources: C:\Users\shogu\AppData\Local\Temp\archive_probe\base
+probe db:      C:\Users\shogu\AppData\Local\Temp\archive-probe-c3ymjxu_\.hermes\probe-kanban.db
+live process on this host: pid 20664
+
+card t_c4a533e0: status=running claim_lock=otherhost:worker claim_expires=expired
+archive guard says: None
+
+[1] hermes kanban archive t_c4a533e0  (process ALIVE) -> rc=0
+    Archived t_c4a533e0
+    status now: archived
+    events:
+      created: {"assignee": "ibf-coder", "status": "ready", "parents": [], "creator_task_id": null, "tenant": null, "workspace_kind": "scratch", "workspace_path": null, "branch_name": null, "project_id": null, "skills": null, "goal_mode": null, "model_override": null, "provider_override": null}
+      claimed: {"lock": "otherhost:worker", "expires": 1789586759, "run_id": 1}
+      spawned: {"pid": 20664}
+      archived: {"actor": "ibf-coder", "source": "cli", "session_id": "20260916_214226_a9933b"}
+      archive_worker_termination: {"prev_pid": 20664, "host_local": false, "termination_attempted": false, "terminated": false, "sigkill": false, "actor": "ibf-coder", "source": "cli", "session_id": "20260916_214226_a9933b"}
+
+[2] hermes kanban archive t_c4a533e0  (process dead) -> rc=1
+    cannot archive t_c4a533e0
+    status now: archived
+    events:
+      created: {"assignee": "ibf-coder", "status": "ready", "parents": [], "creator_task_id": null, "tenant": null, "workspace_kind": "scratch", "workspace_path": null, "branch_name": null, "project_id": null, "skills": null, "goal_mode": null, "model_override": null, "provider_override": null}
+      claimed: {"lock": "otherhost:worker", "expires": 1789586759, "run_id": 1}
+      spawned: {"pid": 20664}
+      archived: {"actor": "ibf-coder", "source": "cli", "session_id": "20260916_214226_a9933b"}
+      archive_worker_termination: {"prev_pid": 20664, "host_local": false, "termination_attempted": false, "terminated": false, "sigkill": false, "actor": "ibf-coder", "source": "cli", "session_id": "20260916_214226_a9933b"}
+
+[3] hermes kanban archive t_6d208386 t_f5d51701  (one card live) -> rc=1
+    Archived t_6d208386
+cannot archive t_f5d51701: its run is still live (pid 26276, pid_alive); reclaim it first, or pass --force to terminate the worker and archive
+    live card:     running (kept running)
+    finished card: archived (untouched)
