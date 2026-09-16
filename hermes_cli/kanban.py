@@ -1046,6 +1046,19 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _live_run_refusal(task_id: str, live: dict) -> str:
+    """Refusal line for the card whose run is still live — names the card and the pid.
+
+    Reporting only: the authority is ``kb.archive_task``'s own guard, which every caller
+    (panel, batch, other profile) passes through; ``kb.live_run_info`` is the same
+    predicate read back so the line can carry the worker pid.
+    """
+    pid = live.get("worker_pid")
+    who = f"pid {pid}" if pid else "a fresh heartbeat"
+    return (f"cannot archive {task_id}: its run is still live ({who}, {live.get('reason')}); "
+            f"reclaim it first, or pass --force to terminate the worker and archive")
+
+
 def _cmd_archive(args: argparse.Namespace) -> int:
     ids = list(args.task_ids or [])
     purge_ids = list(getattr(args, "purge_ids", None) or [])
@@ -1053,12 +1066,20 @@ def _cmd_archive(args: argparse.Namespace) -> int:
         return _err("choose either task_ids to archive or --rm archived task_ids")
     if not ids and not purge_ids:
         return _err("at least one task_id is required")
+    force = bool(getattr(args, "force", False))
+    author = _profile_author()
     with kbc.connect_closing() as conn:
         if purge_ids:
             return _bulk_apply(purge_ids, lambda tid: kb.delete_archived_task(conn, tid), lambda tid: f"Deleted {tid}",
                                lambda tid: f"cannot delete {tid} (must already be archived)")
-        return _bulk_apply(ids, lambda tid: kb.archive_task(conn, tid),
-                           lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}")
+        return _bulk_apply(
+            ids,
+            lambda tid: kb.archive_task(conn, tid, actor=author, source="cli", force=force),
+            lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}",
+            explain=lambda tid: (
+                _live_run_refusal(tid, live) if (live := kb.live_run_info(conn, tid)) else None
+            ),
+        )
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:

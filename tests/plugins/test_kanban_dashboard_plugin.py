@@ -891,6 +891,45 @@ def test_bulk_archive(client):
     assert b["id"] not in ids
 
 
+def test_bulk_archive_refuses_live_run(client, monkeypatch):
+    """The panel's mass cleanup is the same hole as the CLI batch: a card whose run is still
+    live is refused per-id (the rest of the batch still goes through) and keeps running."""
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    ready = client.post("/api/plugins/kanban/tasks", json={"title": "finished"}).json()["task"]
+    live = client.post("/api/plugins/kanban/tasks",
+                       json={"title": "live", "assignee": "a"}).json()["task"]
+    with kbc.connect() as conn:
+        kb.claim_task(conn, live["id"], claimer=f"{kb._host_prefix()}worker")
+        kbd._set_worker_pid(conn, live["id"], 54321)
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: True)
+
+    r = client.post("/api/plugins/kanban/tasks/bulk",
+                    json={"ids": [ready["id"], live["id"]], "archive": True})
+    assert r.status_code == 200
+    outcomes = {row["id"]: row for row in r.json()["results"]}
+    assert outcomes[ready["id"]]["ok"] is True
+    assert outcomes[live["id"]]["ok"] is False
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, live["id"]).status == "running"
+
+
+def test_patch_archive_refuses_live_run(client, monkeypatch):
+    """``PATCH status=archived`` on a running card is a 409, not a silent worker kill."""
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    live = client.post("/api/plugins/kanban/tasks", json={"title": "live"}).json()["task"]
+    with kbc.connect() as conn:
+        kb.claim_task(conn, live["id"], claimer=f"{kb._host_prefix()}worker")
+        kbd._set_worker_pid(conn, live["id"], 54321)
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: True)
+
+    r = client.patch(f"/api/plugins/kanban/tasks/{live['id']}", json={"status": "archived"})
+    assert r.status_code == 409
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, live["id"]).status == "running"
+
+
 def test_bulk_reassign(client):
     a = client.post("/api/plugins/kanban/tasks",
                     json={"title": "a", "assignee": "old"}).json()["task"]
