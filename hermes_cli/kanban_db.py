@@ -3760,30 +3760,47 @@ def specify_triage_task(
 def _live_run_from_row(row: sqlite3.Row) -> Optional[dict[str, Any]]:
     """Liveness evidence for a task row whose run may still be alive; None when archive-safe.
 
-    Two signals, both gated on a HOST-LOCAL claim (a worker claimed by another host cannot be
-    signalled from here, so its archive stays a plain status change):
+    Two signals:
 
-    * the worker process answers ``_pid_alive``;
-    * ``last_heartbeat_at`` is fresher than ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS``.
+    * the worker process answers ``_pid_alive`` — wherever the claim came from, a live
+      process on this host is evidence of work in progress, and the claim lock saying
+      "another host" does not make it not-ours (probe B: an expired foreign claim plus a
+      live local pid archived with rc=0 and no question asked);
+    * ``last_heartbeat_at`` is fresher than ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` on a
+      claim this host owns — the state ``release_stale_claims`` spares and extends.
 
-    This is deliberately a superset of the condition ``release_stale_claims`` spares a claim
-    with: refusing costs one ``--force``, waving a live worker through costs the worker.
+    ``host_local`` is REPORTED, not a gate: it says whether the pid in the evidence is one
+    this host can signal. Refusing costs one ``--force``; waving a live worker through costs
+    the worker. Against the condition ``release_stale_claims`` spares a claim with, the
+    evidence is the same spared set plus a live pid under a foreign lock (that pid is not the
+    claim's worker), minus a heartbeat-only claim that has already expired — the dispatcher
+    reclaims those as ordinary stuck cards, so the archive must not refuse what the tick will
+    take anyway. Expiry is not a liveness signal here at all.
+
+    Declared limit (multi-host fleets): a row whose ``claim_expires`` is NULL never enters
+    ``release_stale_claims``' scan (its WHERE requires a non-NULL deadline), so such a claim is
+    never extended by the tick — and a FOREIGN claim with a fresh heartbeat and no live pid
+    answers ``None`` here, i.e. the archive judges it by the pid alone. On one host that is the
+    same row the dispatcher can see; across hosts it is the residual hole of this predicate: the
+    heartbeat is evidence, but this host cannot tell which machine wrote it, and only the pid
+    signal is host-checkable. Widening the heartbeat signal to foreign claims would fix it and
+    is a deliberate non-goal here (it changes what one host may archive on another host's word).
     """
     if row["status"] != "running":
         return None
-    if not (row["claim_lock"] or "").startswith(_host_prefix()):
-        return None
+    host_local = (row["claim_lock"] or "").startswith(_host_prefix())
     now = int(time.time())
     heartbeat = row["last_heartbeat_at"]
     age = None if heartbeat is None else now - int(heartbeat)
     heartbeat_fresh = age is not None and age <= DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
     pid = _opt_int(row["worker_pid"])
     pid_alive = bool(pid) and _pid_alive(pid)
-    if not pid_alive and not heartbeat_fresh:
+    if not pid_alive and not (heartbeat_fresh and host_local):
         return None
     return {
         "worker_pid": pid,
         "claim_lock": row["claim_lock"],
+        "host_local": host_local,
         "reason": "pid_alive" if pid_alive else "fresh_heartbeat",
         "heartbeat_age": age,
         "claim_expires": _opt_int(row["claim_expires"]),
@@ -3796,9 +3813,10 @@ _LIVE_RUN_COLUMNS = "status, claim_lock, worker_pid, last_heartbeat_at, claim_ex
 def live_run_info(conn: sqlite3.Connection, task_id: str) -> Optional[dict[str, Any]]:
     """``_live_run_from_row`` for ``task_id``; None when it has no run worth protecting.
 
-    The refusal evidence an operator needs (worker pid + which signal says "alive"), so a
-    caller can name the pid instead of reporting a bare "cannot archive" (2026-09-16: a batch
-    archived 128 ibf cards and silently killed the two RUNNING ones among them).
+    The refusal evidence an operator needs (worker pid, its host-locality, which signal says
+    "alive"), so a caller can name the pid instead of reporting a bare "cannot archive"
+    (2026-09-16: a batch archived 128 ibf cards and silently killed the two RUNNING ones among
+    them). Same predicate as the guard: what this returns is what ``archive_task`` refused on.
     """
     row = conn.execute(
         f"SELECT {_LIVE_RUN_COLUMNS} FROM tasks WHERE id = ?", (task_id,),
@@ -3806,16 +3824,49 @@ def live_run_info(conn: sqlite3.Connection, task_id: str) -> Optional[dict[str, 
     return _live_run_from_row(row) if row else None
 
 
-def _archive_initiator(actor: Optional[str], source: Optional[str]) -> dict[str, Any]:
-    """Who is archiving: profile, session, calling surface.
+def record_archive_refusals(
+    conn: sqlite3.Connection, task_ids: Iterable[str], *,
+    actor: Optional[str] = None, source: Optional[str] = None,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Ask the archive guard about a WHOLE batch before the first write.
+
+    Returns ``[(task_id, live evidence)]`` for every id whose run is live, already recorded as
+    an ``archive_refused`` event; empty when the batch is safe to archive. A batch is one
+    operator decision, so it is asked before the first card is touched (2026-09-16: a 128-card
+    cleanup archived the first 126, killed the two running ones it never asked about, and
+    returned 0). The event stays the DB layer's to write, so the audit trail is the same
+    whether a caller refuses card by card (:func:`archive_task`) or up front (here).
+    """
+    initiator = _archive_initiator(actor, source)
+    refused: list[tuple[str, dict[str, Any]]] = []
+    with write_txn(conn):
+        for task_id in task_ids:
+            live = live_run_info(conn, task_id)
+            if live is None:
+                continue
+            _append_event(conn, task_id, "archive_refused", {**initiator, **live})
+            refused.append((task_id, live))
+    return refused
+
+
+def _archive_initiator(
+    actor: Optional[str], source: Optional[str], *, force: bool = False,
+) -> dict[str, Any]:
+    """Who is archiving — profile, session, calling surface — and whether they overrode the guard.
 
     ``task_events`` has no actor column and every ``archived`` payload was NULL, so after the
     2026-09-16 cleanup nobody could say who had taken the board down. The initiator rides in
     the existing ``payload`` field — no schema change.
+
+    ``force`` rides with it because the ``archived`` event is the only record of the archive:
+    without the flag, an archive that terminated a live worker reads exactly like a card that
+    was already finished (the same payload, the only difference a ``terminated`` field on an
+    event the operator has to know to look for).
     """
     initiator: dict[str, Any] = {
         "actor": (actor or "").strip() or _hook_profile_name(),
         "source": (source or "").strip() or os.environ.get("HERMES_SESSION_SOURCE") or "unknown",
+        "force": bool(force),
     }
     session_id = os.environ.get("HERMES_SESSION_ID")
     if session_id:
@@ -3833,9 +3884,13 @@ def archive_task(
     (:func:`live_run_info`) unless ``force`` — the operator's explicit override. Archiving
     used to look identical for a finished and a running card: the 2026-09-16 ibf cleanup
     archived 128 cards in one batch, killed the two workers that were still running, asked
-    nothing and returned 0. ``archive_refused`` records the refusal with its evidence.
-    The ``archived`` event always carries the initiator (profile, session, surface), as does
-    the termination report — the two events that say what happened to a live card.
+    nothing and returned 0. ``archive_refused`` records the refusal with its evidence
+    (``worker_pid``, ``host_local``, which signal, the heartbeat age) — the evidence is
+    REPORTING only, the guard's decision is the same in every caller, and it is deliberately
+    coarser than ``release_stale_claims``: a live pid under a foreign claim refuses too,
+    because a reused pid cannot be told from a worker at this layer. The ``archived`` event
+    always carries the initiator (profile, session, surface, ``force``), as does the
+    termination report — the two events that say what happened to a live card.
 
     Clearing ``worker_pid`` in the DB alone left the OS process running past its
     own archive — it kept executing (and pushing work) against a task nothing
@@ -3847,8 +3902,13 @@ def archive_task(
     dispatcher can spawn a duplicate worker off the released claim. The
     termination outcome lands as its own ``archive_worker_termination`` event so
     the ``archived`` event stays atomic with the status flip.
+
+    ``archive_refused`` sits in the event history NEXT TO the successful ``archived`` that
+    follows it on a forced retry: both are true records of the two calls — ``write_txn``
+    commits on exit, so the refusal is durable before the forced archive is attempted, and
+    the pair is the point (the card was asked about, then overridden).
     """
-    initiator = _archive_initiator(actor, source)
+    initiator = _archive_initiator(actor, source, force=force)
     with write_txn(conn):
         row = conn.execute(
             f"SELECT {_LIVE_RUN_COLUMNS} FROM tasks WHERE id = ?", (task_id,),

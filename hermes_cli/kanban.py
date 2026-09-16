@@ -1047,16 +1047,42 @@ def _cmd_promote(args: argparse.Namespace) -> int:
 
 
 def _live_run_refusal(task_id: str, live: dict) -> str:
-    """Refusal line for the card whose run is still live — names the card and the pid.
+    """Refusal line for the card whose run is still live — names the card, the pid and the evidence.
 
     Reporting only: the authority is ``kb.archive_task``'s own guard, which every caller
     (panel, batch, other profile) passes through; ``kb.live_run_info`` is the same
     predicate read back so the line can carry the worker pid.
+
+    The line says WHICH signal it read (a live pid answers differently from a heartbeat) and
+    whether that pid is one this host owns — a reused pid or an unrelated local process reads
+    exactly like a real worker otherwise, and the operator's only cue is this text.
     """
     pid = live.get("worker_pid")
-    who = f"pid {pid}" if pid else "a fresh heartbeat"
-    return (f"cannot archive {task_id}: its run is still live ({who}, {live.get('reason')}); "
-            f"reclaim it first, or pass --force to terminate the worker and archive")
+    if pid:
+        who = (f"worker_pid {pid} is alive on this host" if live.get("host_local", True)
+               else f"worker_pid {pid} is alive on this host but the claim belongs to another host")
+    else:
+        who = "a fresh heartbeat on a claim this host owns"
+    age = live.get("heartbeat_age")
+    age_txt = "no heartbeat recorded" if age is None else f"heartbeat age {age}s"
+    return (f"cannot archive {task_id}: {who} ({live.get('reason')}, {age_txt}); "
+            f"if it is not this card's worker, pass --force to terminate it and archive")
+
+
+def _batch_live_run_refusals(conn, ids: list[str], *, actor) -> list[str]:
+    """Refusal lines for every id in ``ids`` whose run is live — the batch's whole answer.
+
+    A batch is one operator decision, so it is asked before the first card is archived
+    (2026-09-16: a 128-card cleanup archived the first 126, killed the two running ones it
+    never asked about, and returned 0). ``--force`` is the single answer for the whole batch;
+    it is not per-id, because an operator who overrides the guard once means it for the call.
+    The refusal events are written by ``kb.record_archive_refusals`` — the same audit trail the
+    card-by-card path leaves.
+    """
+    return [
+        _live_run_refusal(tid, live)
+        for tid, live in kb.record_archive_refusals(conn, ids, actor=actor, source="cli")
+    ]
 
 
 def _cmd_archive(args: argparse.Namespace) -> int:
@@ -1070,8 +1096,23 @@ def _cmd_archive(args: argparse.Namespace) -> int:
     author = _profile_author()
     with kbc.connect_closing() as conn:
         if purge_ids:
-            return _bulk_apply(purge_ids, lambda tid: kb.delete_archived_task(conn, tid), lambda tid: f"Deleted {tid}",
-                               lambda tid: f"cannot delete {tid} (must already be archived)")
+            # ``--force`` is the archive guard's flag and means nothing to a purge: a card can
+            # only be purged once it is already ``archived``. Accepting it silently reads the
+            # operator as having overridden something that was never asked (and, before the
+            # parser fix, ``--force`` landed in the id list instead).
+            if force:
+                print("note: --force has no effect with --rm — purging requires an already "
+                      "archived card; it overrides only the live-run archive guard",
+                      file=sys.stderr)
+            return _bulk_apply(
+                purge_ids, lambda tid: kb.delete_archived_task(conn, tid), lambda tid: f"Deleted {tid}",
+                lambda tid: f"cannot delete {tid} (must already be archived)")
+        if ids and not force:
+            refusals = _batch_live_run_refusals(conn, ids, actor=author)
+            if refusals:
+                for line in refusals:
+                    print(line, file=sys.stderr)
+                return 1
         return _bulk_apply(
             ids,
             lambda tid: kb.archive_task(conn, tid, actor=author, source="cli", force=force),
