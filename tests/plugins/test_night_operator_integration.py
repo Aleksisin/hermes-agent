@@ -124,7 +124,7 @@ class NightOperatorIntegration(unittest.TestCase):
         module.register(ctx)
         self.assertEqual({name for name, _ in ctx.hooks}, {
             "kanban_task_claimed", "kanban_task_completed", "kanban_task_blocked",
-            "on_kanban_dispatch_tick",
+            "on_kanban_dispatch_tick", "pre_tool_call",
         })
         self.assertEqual([entry["name"] for entry in ctx.cli], ["night-operator"])
         parser = __import__("argparse").ArgumentParser()
