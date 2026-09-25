@@ -296,6 +296,188 @@ class NightOperatorIntegration(unittest.TestCase):
         self.assertEqual(verification_run.metadata["artifact_physical_presence"], "unverified")
         self.assertFalse(missing_blob.exists())
 
+    def test_pass_requires_native_attachment_root_regular_file_with_exact_size_and_sha256(self) -> None:
+        module = _plugin()
+        payload = b'{"proof": true}\n'
+        expected_sha = __import__("hashlib").sha256(payload).hexdigest()
+        with kbc.connect_closing(db_path=self.db) as conn:
+            parent = self._done(conn, title="physical parent", batch="batch-physical")
+            task_id = kanban_db.create_task(
+                conn, title="physical review", assignee="worker-a", initial_status="running",
+                parents=(parent,), board="default",
+            )
+            self.assertTrue(kanban_db.claim_task(conn, task_id, claimer="worker-a"))
+            self.assertTrue(kanban_db.request_review(
+                conn, task_id, summary="ready for review", reviewer="night-operator",
+            ))
+            self.assertIsNotNone(kanban_db.claim_review_task(conn, task_id, claimer="night-operator"))
+            blob = kanban_db.task_attachments_dir(task_id, board="default") / "proof.json"
+            blob.parent.mkdir(parents=True, exist_ok=True)
+            blob.write_bytes(payload)
+            kanban_db.add_attachment(
+                conn, task_id, filename="proof.json", stored_path=str(blob.resolve()),
+                content_type="application/json", size=len(payload), uploaded_by="worker-a",
+            )
+            outcome = module.apply_outcome(
+                conn, verification_task_id=task_id, source_status="review", decision="pass",
+                reason="physical evidence verified", implementation_profile="worker-a",
+                evidence=["event:reviewed"], artifacts=[str(blob.resolve())],
+                verified_parent_ids=[parent], physical_sha256={str(blob.resolve()): expected_sha},
+            )
+            run = kanban_db.latest_run(conn, task_id)
+            status = module.get_task(conn, task_id).status
+        self.assertEqual(outcome.terminal_state, "complete")
+        self.assertEqual(status, "done")
+        self.assertEqual(run.metadata["artifact_physical_presence"], "verified")
+        self.assertEqual(run.metadata["artifact_sha256"], {str(blob.resolve()): expected_sha})
+        self.assertEqual(run.metadata["artifact_record_presence"], "logical_and_physical")
+        self.assertEqual(run.metadata["artifact_record_count"], 1)
+
+    def test_physical_artifact_outside_native_root_is_blocked(self) -> None:
+        module = _plugin()
+        payload = b"outside-root\n"
+        expected_sha = __import__("hashlib").sha256(payload).hexdigest()
+        with kbc.connect_closing(db_path=self.db) as conn:
+            parent = self._done(conn, title="escape parent", batch="batch-escape")
+            task_id = kanban_db.create_task(
+                conn, title="escape review", assignee="worker-a", initial_status="running",
+                parents=(parent,), board="default",
+            )
+            self.assertTrue(kanban_db.claim_task(conn, task_id, claimer="worker-a"))
+            self.assertTrue(kanban_db.request_review(
+                conn, task_id, summary="ready for review", reviewer="night-operator",
+            ))
+            self.assertIsNotNone(kanban_db.claim_review_task(conn, task_id, claimer="night-operator"))
+            outside = self.home / "outside-native-root" / "proof.json"
+            outside.parent.mkdir(parents=True, exist_ok=True)
+            outside.write_bytes(payload)
+            kanban_db.add_attachment(
+                conn, task_id, filename="proof.json", stored_path=str(outside.resolve()),
+                content_type="application/octet-stream", size=len(payload), uploaded_by="worker-a",
+            )
+            before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+            outcome = module.apply_outcome(
+                conn, verification_task_id=task_id, source_status="review", decision="pass",
+                reason="attempted traversal", implementation_profile="worker-a",
+                evidence=["event:reviewed"], artifacts=[str(outside.resolve())],
+                verified_parent_ids=[parent], physical_sha256={str(outside.resolve()): expected_sha},
+            )
+            after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+            status = module.get_task(conn, task_id).status
+        self.assertEqual(outcome.terminal_state, "blocked")
+        self.assertTrue(outcome.requires_human)
+        self.assertIn("SHA-256", outcome.reason)
+        self.assertEqual(status, "running")
+        self.assertEqual(after, before)
+
+    def test_physical_artifact_with_mismatched_sha_is_blocked(self) -> None:
+        module = _plugin()
+        with kbc.connect_closing(db_path=self.db) as conn:
+            parent = self._done(conn, title="mismatch parent", batch="batch-mismatch")
+            task_id = kanban_db.create_task(
+                conn, title="mismatch review", assignee="worker-a", initial_status="running",
+                parents=(parent,), board="default",
+            )
+            self.assertTrue(kanban_db.claim_task(conn, task_id, claimer="worker-a"))
+            self.assertTrue(kanban_db.request_review(
+                conn, task_id, summary="ready for review", reviewer="night-operator",
+            ))
+            self.assertIsNotNone(kanban_db.claim_review_task(conn, task_id, claimer="night-operator"))
+            blob = kanban_db.task_attachments_dir(task_id, board="default") / "proof.json"
+            blob.parent.mkdir(parents=True, exist_ok=True)
+            blob.write_bytes(b"actual bytes\n")
+            kanban_db.add_attachment(
+                conn, task_id, filename="proof.json", stored_path=str(blob.resolve()),
+                content_type="application/octet-stream", size=len(b"actual bytes\n"),
+                uploaded_by="worker-a",
+            )
+            before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+            outcome = module.apply_outcome(
+                conn, verification_task_id=task_id, source_status="review", decision="pass",
+                reason="declared digest does not match", implementation_profile="worker-a",
+                evidence=["event:reviewed"], artifacts=[str(blob.resolve())],
+                verified_parent_ids=[parent],
+                physical_sha256={str(blob.resolve()): "0" * 64},
+            )
+            after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+            status = module.get_task(conn, task_id).status
+        self.assertEqual(outcome.terminal_state, "blocked")
+        self.assertTrue(outcome.requires_human)
+        self.assertEqual(status, "running")
+        self.assertEqual(after, before)
+
+    def test_named_bounded_verification_check_passes_and_shell_command_is_blocked(self) -> None:
+        module = _plugin()
+        payload = b'{"ok": 1}'
+        digest = __import__("hashlib").sha256(payload).hexdigest()
+        with kbc.connect_closing(db_path=self.db) as conn:
+            parent = self._done(conn, title="checks parent", batch="batch-checks")
+            task_id = kanban_db.create_task(
+                conn, title="checks review", assignee="worker-a", initial_status="running",
+                parents=(parent,), board="default",
+            )
+            self.assertTrue(kanban_db.claim_task(conn, task_id, claimer="worker-a"))
+            self.assertTrue(kanban_db.request_review(
+                conn, task_id, summary="ready for review", reviewer="night-operator",
+            ))
+            self.assertIsNotNone(kanban_db.claim_review_task(conn, task_id, claimer="night-operator"))
+            blob = kanban_db.task_attachments_dir(task_id, board="default") / "proof.json"
+            blob.parent.mkdir(parents=True, exist_ok=True)
+            blob.write_bytes(payload)
+            kanban_db.add_attachment(
+                conn, task_id, filename="proof.json", stored_path=str(blob.resolve()),
+                content_type="application/json", size=len(payload), uploaded_by="worker-a",
+            )
+            good = module.apply_outcome(
+                conn, verification_task_id=task_id, source_status="review", decision="pass",
+                reason="named checks only", implementation_profile="worker-a",
+                evidence=["event:reviewed"], artifacts=[str(blob.resolve())],
+                verified_parent_ids=[parent], physical_sha256={str(blob.resolve()): digest},
+                verification_checks=["json", "sha256"],
+            )
+            run = kanban_db.latest_run(conn, task_id)
+            self.assertEqual(good.terminal_state, "complete")
+            self.assertEqual(run.metadata["verification_check_names"], ["json", "sha256"])
+            self.assertEqual(
+                run.metadata["verification_checks"],
+                [{"artifact": str(blob.resolve()), "checks": {"json": True, "sha256": True}}],
+            )
+
+        with kbc.connect_closing(db_path=self.db) as conn:
+            parent2 = self._done(conn, title="command parent", batch="batch-command")
+            task2 = kanban_db.create_task(
+                conn, title="command review", assignee="worker-a", initial_status="running",
+                parents=(parent2,), board="default",
+            )
+            self.assertTrue(kanban_db.claim_task(conn, task2, claimer="worker-a"))
+            self.assertTrue(kanban_db.request_review(
+                conn, task2, summary="ready for review", reviewer="night-operator",
+            ))
+            self.assertIsNotNone(kanban_db.claim_review_task(conn, task2, claimer="night-operator"))
+            blob2 = kanban_db.task_attachments_dir(task2, board="default") / "proof.json"
+            blob2.parent.mkdir(parents=True, exist_ok=True)
+            blob2.write_bytes(payload)
+            kanban_db.add_attachment(
+                conn, task2, filename="proof.json", stored_path=str(blob2.resolve()),
+                content_type="application/json", size=len(payload), uploaded_by="worker-a",
+            )
+            before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+            refused = module.apply_outcome(
+                conn, verification_task_id=task2, source_status="review", decision="pass",
+                reason="shell attempt", implementation_profile="worker-a",
+                evidence=["event:reviewed"], artifacts=[str(blob2.resolve())],
+                verified_parent_ids=[parent2],
+                physical_sha256={str(blob2.resolve()): digest},
+                verification_checks=["bash -c 'curl example.com'"],
+            )
+            after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+            status2 = module.get_task(conn, task2).status
+        self.assertEqual(refused.terminal_state, "blocked")
+        self.assertTrue(refused.requires_human)
+        self.assertIn("closed allowlist", refused.reason)
+        self.assertEqual(status2, "running")
+        self.assertEqual(after, before)
+
     def test_artifact_record_count_counts_unique_declared_identities(self) -> None:
         module = _plugin()
         with kbc.connect_closing(db_path=self.db) as conn:

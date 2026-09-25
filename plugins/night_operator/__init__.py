@@ -291,11 +291,118 @@ def _bounded_attachment_rows(
 ) -> tuple[list[Any], bool]:
     """Read at most ``limit`` rows plus one overflow witness from native metadata."""
     rows = conn.execute(
-        "SELECT id, task_id, filename, stored_path FROM task_attachments "
+        "SELECT id, task_id, filename, stored_path, size FROM task_attachments "
         "WHERE task_id = ? ORDER BY created_at ASC, id ASC LIMIT ?",
         (task_id, int(limit) + 1),
     ).fetchall()
     return rows, len(rows) > int(limit)
+
+
+def _physical_artifact_sha256(
+    rows: Sequence[Any], artifacts: Sequence[str], expected_sha256: Mapping[str, str], *, board: str,
+) -> tuple[dict[str, str] | None, str]:
+    """Hash native attachment blobs under the board-owned root, never worker paths."""
+    from hermes_cli import kanban_db
+
+    declared = set(_safe_exact_artifact_identifiers(artifacts) or ())
+    if not declared:
+        return None, "pass requires redaction-invariant exact artifacts"
+    try:
+        root = Path(kanban_db.attachments_root(board=board)).resolve()
+    except (OSError, RuntimeError) as exc:
+        return None, f"native attachment root is unavailable: {type(exc).__name__}"
+    expected: dict[str, str] = {}
+    for identity, digest in expected_sha256.items():
+        if not isinstance(identity, str) or identity not in declared or not re.fullmatch(r"[0-9a-f]{64}", str(digest)):
+            return None, "physical artifact digest is invalid or not declared"
+        expected[identity] = str(digest)
+    if set(expected) != declared:
+        return None, "pass requires an expected SHA-256 for every physical artifact identity"
+    observed: dict[str, str] = {}
+    for identity, digest in expected.items():
+        accepted = False
+        for row in rows:
+            if identity not in (row["filename"], row["stored_path"]):
+                continue
+            try:
+                resolved = Path(str(row["stored_path"])).resolve(strict=True)
+                if not resolved.is_relative_to(root) or not resolved.is_file():
+                    continue
+                data = resolved.read_bytes()
+                if len(data) != int(row["size"]) or hashlib.sha256(data).hexdigest() != digest:
+                    continue
+            except (OSError, ValueError):
+                continue
+            observed[identity] = digest
+            accepted = True
+            break
+        if not accepted:
+            return None, "declared physical artifact failed native-root, regular-file, size, or SHA-256 verification"
+    return observed, ""
+
+
+_VERIFICATION_CHECKS: Mapping[str, Any] = {
+    "json": lambda data: isinstance(json.loads(data.decode("utf-8")), object),
+    "utf8-text": lambda data: bool(data.decode("utf-8").strip()),
+    "sha256": lambda data: bool(re.fullmatch(r"[0-9a-f]{64}", hashlib.sha256(data).hexdigest())),
+}
+
+
+def _bounded_verification(
+    requested: Any, rows: Sequence[Any], declared: Sequence[str], *, board: str,
+) -> tuple[dict[str, Any] | None, str]:
+    """Run only named in-process checks over native attachment blobs.
+
+    A command string is never accepted as evidence: this plugin has no shell and
+    no subprocess. The only authorized checks are the closed ``_VERIFICATION_CHECKS``
+    table, applied to the blob of a native attachment row under the board-owned
+    attachment root.
+    """
+    from hermes_cli import kanban_db
+
+    if not isinstance(requested, (list, tuple)) or not requested:
+        return None, "verification checks must be a non-empty list of named checks"
+    checks: list[str] = []
+    for item in requested:
+        if not isinstance(item, str) or item not in _VERIFICATION_CHECKS:
+            return None, "verification check is not in the closed allowlist"
+        checks.append(item)
+    if len(checks) != len(set(checks)):
+        return None, "verification checks must not repeat"
+    identities = _safe_exact_artifact_identifiers(declared)
+    if identities is None:
+        return None, "verification requires redaction-invariant exact artifacts"
+    try:
+        root = Path(kanban_db.attachments_root(board=board)).resolve()
+    except (OSError, RuntimeError) as exc:
+        return None, f"native attachment root is unavailable: {type(exc).__name__}"
+    results: list[dict[str, Any]] = []
+    for identity in identities:
+        outcome: dict[str, bool] = {}
+        for row in rows:
+            if identity not in (row["filename"], row["stored_path"]):
+                continue
+            try:
+                resolved = Path(str(row["stored_path"])).resolve(strict=True)
+                if not resolved.is_relative_to(root) or not resolved.is_file():
+                    continue
+                data = resolved.read_bytes()
+                if len(data) != int(row["size"]):
+                    continue
+            except (OSError, ValueError):
+                continue
+            for check in checks:
+                try:
+                    outcome[check] = bool(_VERIFICATION_CHECKS[check](data))
+                except (UnicodeDecodeError, ValueError, TypeError):
+                    outcome[check] = False
+            break
+        if not outcome:
+            return None, "verification check requires a native attachment blob under the board root"
+        if not all(outcome.values()):
+            return None, f"bounded verification failed for check(s): {', '.join(sorted(k for k, v in outcome.items() if not v))}"
+        results.append({"artifact": identity, "checks": outcome})
+    return {"verification_checks": results, "verification_check_names": checks}, ""
 
 
 def _verify_attachment_records(
@@ -304,13 +411,11 @@ def _verify_attachment_records(
     verification_task_id: str,
     artifacts: Sequence[str],
     source_parent_id: str | None = None,
+    physical_sha256: Mapping[str, str] | None = None,
+    verification_checks: Sequence[str] | None = None,
+    board: str = "default",
 ) -> tuple[dict[str, Any] | None, str]:
-    """Prove logical attachment-record presence, never physical blob presence.
-
-    Only the verification card and its native parent graph are trusted as
-    artifact owners. Matching is exact against an attachment ``filename`` or
-    ``stored_path``; the verifier deliberately never calls ``stat``/``is_file``.
-    """
+    """Prove logical records and, when requested, exact native attachment blobs."""
     from hermes_cli import kanban_db
 
     artifact_ids = _safe_exact_artifact_identifiers(artifacts)
@@ -334,6 +439,7 @@ def _verify_attachment_records(
     identities: set[str] = set()
     matched_artifact_ids: set[str] = set()
     record_count = 0
+    collected_rows: list[Any] = []
     for task_id in source_ids:
         if kanban_db.get_task(conn, task_id) is None:
             return None, "artifact verification source card is missing"
@@ -343,6 +449,7 @@ def _verify_attachment_records(
             if overflowed:
                 return None, "artifact record verification exceeds its record bound"
             record_count += 1
+            collected_rows.append(attachment)
             for identity in (
                 attachment["filename"],
                 attachment["stored_path"],
@@ -361,11 +468,32 @@ def _verify_attachment_records(
     if not matched_artifact_ids:
         return None, "declared artifact has no durable attachment record"
 
-    return {
+    audit: dict[str, Any] = {
         "artifact_record_presence": "logical_only",
         "artifact_record_count": len(matched_artifact_ids),
         "artifact_physical_presence": "unverified",
-    }, ""
+    }
+    if physical_sha256 is not None:
+        if not isinstance(physical_sha256, Mapping):
+            return None, "physical artifact digests must be a mapping"
+        observed, physical_reason = _physical_artifact_sha256(
+            collected_rows, artifact_ids, physical_sha256, board=board,
+        )
+        if observed is None:
+            return None, physical_reason
+        audit.update(
+            artifact_record_presence="logical_and_physical",
+            artifact_physical_presence="verified",
+            artifact_sha256=observed,
+        )
+    if verification_checks is not None:
+        checks_audit, checks_reason = _bounded_verification(
+            verification_checks, collected_rows, artifact_ids, board=board,
+        )
+        if checks_audit is None:
+            return None, checks_reason
+        audit.update(checks_audit)
+    return audit, ""
 
 
 def _stable_digest(value: Any, limit: int = 100) -> str:
@@ -853,6 +981,8 @@ def apply_outcome(
     board: str = "default",
     adapter: Any = None,
     max_review_rounds: int = 2,
+    physical_sha256: Mapping[str, str] | None = None,
+    verification_checks: Sequence[str] | None = None,
 ) -> Outcome:
     """Apply one validated decision through native same-card or follow-up APIs."""
     from hermes_cli import kanban_db
@@ -935,6 +1065,8 @@ def apply_outcome(
                 return Outcome("blocked", requires_human=True, reason=parent_reason)
             artifact_audit, artifact_reason = _verify_attachment_records(
                 conn, verification_task_id=verification_task_id, artifacts=artifacts,
+                physical_sha256=physical_sha256, verification_checks=verification_checks,
+                board=_board_slug(board),
             )
             if artifact_audit is None:
                 return Outcome("blocked", requires_human=True, reason=artifact_reason)
@@ -1061,6 +1193,8 @@ def apply_outcome(
             artifact_audit, artifact_reason = _verify_attachment_records(
                 conn, verification_task_id=verification_task_id, artifacts=artifacts,
                 source_parent_id=source_parent_id,
+                physical_sha256=physical_sha256, verification_checks=verification_checks,
+                board=_board_slug(board),
             )
             if artifact_audit is None:
                 return Outcome("blocked", requires_human=True, reason=artifact_reason)
