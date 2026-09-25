@@ -478,6 +478,79 @@ class NightOperatorIntegration(unittest.TestCase):
         self.assertEqual(status2, "running")
         self.assertEqual(after, before)
 
+    def test_pre_tool_call_blocks_denied_tools_only_inside_the_operator_profile(self) -> None:
+        module = _plugin()
+        class Ctx:
+            plugin_id = "night-operator"
+            def __init__(self) -> None:
+                self.hooks: list[tuple[str, Any]] = []
+            def get_config(self, key: str, default: Any = None) -> Any:
+                return {"enabled": True, "dry_run": False, "enforce_tools": True,
+                        "operator_profile": "night-operator"}.get(key, default)
+            def register_hook(self, name: str, callback: Any) -> None:
+                self.hooks.append((name, callback))
+            def register_cli_command(self, **entry: Any) -> None:
+                pass
+        ctx = Ctx()
+        module.register(ctx)
+        self.assertIn("pre_tool_call", {name for name, _ in ctx.hooks})
+
+        with mock.patch.object(module, "_operator_profile_active", return_value="night-operator"):
+            denied = module._on_pre_tool_call(
+                ctx, tool_name="terminal", args={"command": "rm -rf /"}, session_id="s1",
+            )
+            self.assertIsNotNone(denied)
+            self.assertEqual(denied["action"], "block")
+            self.assertIn("terminal", denied["message"])
+
+            for tool in ("browser_use", "vault_list", "web_search", "cronjob_manage", "execute_code"):
+                directive = module._on_pre_tool_call(
+                    ctx, tool_name=tool, args={}, session_id="s1",
+                )
+                self.assertIsNotNone(directive, tool)
+                self.assertEqual(directive["action"], "block", tool)
+
+            for tool in ("kanban_show", "kanban_comment", "kanban_attachments", "read_file"):
+                self.assertIsNone(
+                    module._on_pre_tool_call(ctx, tool_name=tool, args={}, session_id="s1"), tool,
+                )
+
+    def test_pre_tool_call_stays_silent_in_a_foreign_profile(self) -> None:
+        module = _plugin()
+        class Ctx:
+            plugin_id = "night-operator"
+            def __init__(self) -> None:
+                self.hooks: list[tuple[str, Any]] = []
+            def get_config(self, key: str, default: Any = None) -> Any:
+                return {"enabled": True, "dry_run": False, "enforce_tools": True,
+                        "operator_profile": "night-operator"}.get(key, default)
+            def register_hook(self, name: str, callback: Any) -> None:
+                self.hooks.append((name, callback))
+            def register_cli_command(self, **entry: Any) -> None:
+                pass
+        ctx = Ctx()
+        module.register(ctx)
+        with mock.patch.object(module, "_operator_profile_active", return_value="ibf-operator"):
+            self.assertIsNone(module._on_pre_tool_call(
+                ctx, tool_name="terminal", args={"command": "echo hi"}, session_id="s1",
+            ))
+
+        class Disabled(Ctx):
+            def get_config(self, key: str, default: Any = None) -> Any:
+                return {"enabled": True, "dry_run": False, "enforce_tools": False}.get(key, default)
+        with mock.patch.object(module, "_operator_profile_active", return_value="night-operator"):
+            self.assertIsNone(module._on_pre_tool_call(
+                Disabled(), tool_name="terminal", args={"command": "echo hi"}, session_id="s1",
+            ))
+
+        class Off(Ctx):
+            def get_config(self, key: str, default: Any = None) -> Any:
+                return {"enabled": False}.get(key, default)
+        with mock.patch.object(module, "_operator_profile_active", return_value="night-operator"):
+            self.assertIsNone(module._on_pre_tool_call(
+                Off(), tool_name="terminal", args={"command": "echo hi"}, session_id="s1",
+            ))
+
     def test_artifact_record_count_counts_unique_declared_identities(self) -> None:
         module = _plugin()
         with kbc.connect_closing(db_path=self.db) as conn:

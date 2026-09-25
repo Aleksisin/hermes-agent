@@ -43,6 +43,8 @@ DEFAULTS: Mapping[str, Any] = {
     "reconciliation_interval_seconds": 300,
     "escalation_channel": None,
     "max_items": 100,
+    "enforce_tools": True,
+    "operator_profile": "night-operator",
 }
 
 
@@ -57,6 +59,7 @@ class Config:
     escalation_channel: str | None = None
     max_items: int = 100
     operator_profile: str = "night-operator"
+    enforce_tools: bool = True
 
 
 @dataclass
@@ -403,6 +406,66 @@ def _bounded_verification(
             return None, f"bounded verification failed for check(s): {', '.join(sorted(k for k, v in outcome.items() if not v))}"
         results.append({"artifact": identity, "checks": outcome})
     return {"verification_checks": results, "verification_check_names": checks}, ""
+
+
+_DENIED_TOOLS: frozenset[str] = frozenset({
+    "terminal", "process", "browser_use", "browser_exec", "computer_use",
+    "vault_list", "vault_fill", "vault_unlock", "vault_enter_code", "vault_save_login",
+    "web_search", "web_extract", "execute_code", "cronjob_manage", "todo_list",
+})
+
+
+def _operator_profile_active() -> str:
+    """Resolve the live profile from native profile state, not from plugin text."""
+    try:
+        from hermes_cli import profiles
+    except Exception:
+        return ""
+    for getter in ("get_active_profile_name", "get_active_profile"):
+        try:
+            value = getattr(profiles, getter)()
+        except Exception:
+            continue
+        name = _text(value, 100)
+        if name and name != "custom":
+            return name
+    return ""
+
+
+def _on_pre_tool_call(
+    ctx: Any, tool_name: str = "", args: Any = None, session_id: str = "", **_: Any,
+) -> dict[str, Any] | None:
+    """Fail-closed, profile-scoped denial of dangerous tools.
+
+    Returns the native block directive only inside the operator profile: the
+    operator reviews Kanban events, never pixels, and never holds a shell,
+    browser, vault or network capability. The scope comes from the live profile
+    resolved by the runtime (plus the configured operator profile), so a foreign
+    profile such as ``ibf-operator`` is never restricted by this plugin. A
+    profile that cannot be resolved fails open for safety of other profiles.
+    """
+    config = _config_from_context(ctx)
+    if not config.enabled or not config.enforce_tools:
+        return None
+    live = _operator_profile_active()
+    expected = _text(config.operator_profile, 100) or "night-operator"
+    candidates = {name for name in (live, expected) if name}
+    if not any(name.startswith(expected) for name in candidates):
+        return None
+    if live and not live.startswith(expected):
+        # A foreign live profile wins: never deny tools outside the operator.
+        return None
+    if not isinstance(tool_name, str) or not tool_name:
+        return None
+    if tool_name in _DENIED_TOOLS:
+        return {
+            "action": "block",
+            "message": (
+                f"night-operator policy denies tool {tool_name!r}: the operator reviews "
+                "Kanban events without a shell, browser, vault, network or scheduler capability"
+            ),
+        }
+    return None
 
 
 def _verify_attachment_records(
@@ -1390,6 +1453,7 @@ def _config_from_context(ctx: Any) -> Config:
         escalation_channel=read("escalation_channel", DEFAULTS["escalation_channel"]),
         max_items=_durable_int(read("max_items", DEFAULTS["max_items"]), DEFAULTS["max_items"]),
         operator_profile=_text(read("operator_profile", "night-operator"), 100) or "night-operator",
+        enforce_tools=_strict_bool(read("enforce_tools", DEFAULTS["enforce_tools"]), DEFAULTS["enforce_tools"]),
     )
 
 
@@ -1507,6 +1571,7 @@ def register(ctx: Any) -> None:
     ctx.register_hook("kanban_task_claimed", _on_claimed)
     ctx.register_hook("kanban_task_completed", lambda **kwargs: _on_completed(ctx, **kwargs))
     ctx.register_hook("kanban_task_blocked", lambda **kwargs: _on_blocked(ctx, **kwargs))
+    ctx.register_hook("pre_tool_call", lambda **kwargs: _on_pre_tool_call(ctx, **kwargs))
     ctx.register_cli_command(
         name="night-operator",
         help="Inspect or run one bounded native Kanban reconciliation sweep",
