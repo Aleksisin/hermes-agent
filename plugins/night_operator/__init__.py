@@ -1399,6 +1399,61 @@ def render_notice(board: str, card: ReviewEvidence, outcome: Outcome) -> dict[st
     }
 
 
+_CHANNEL_RE = re.compile(r"^([a-z][a-z0-9_]{1,31}):([A-Za-z0-9_.:-]{1,128})$")
+
+
+def _parse_channel(value: Any) -> tuple[str, str] | None:
+    """Parse ``platform:chat_id`` strictly; anything else is not a channel."""
+    if not isinstance(value, str):
+        return None
+    match = _CHANNEL_RE.match(value.strip())
+    if match is None:
+        return None
+    platform, chat_id = match.group(1), match.group(2)
+    if platform in _DENIED_TOOLS or platform.startswith("hermes_"):
+        return None
+    return platform, chat_id
+
+
+def deliver_notice(
+    conn: Any, notice: Mapping[str, Any], *, task_id: str, channel: Any,
+) -> dict[str, Any]:
+    """Register a native terminal-state subscription for a human channel.
+
+    Delivery is owned by the native notifier; this only subscribes the task, so
+    a configured channel is a real notification path and an absent or malformed
+    channel fails closed instead of silently claiming an escalation was sent.
+    """
+    parsed = _parse_channel(channel)
+    if parsed is None:
+        return {"ok": False, "reason": "no_channel"}
+    platform, chat_id = parsed
+    from hermes_cli import kanban_db_notify
+
+    try:
+        kanban_db_notify.add_notify_sub(
+            conn, task_id=task_id, platform=platform, chat_id=chat_id,
+            notifier_profile=_text(DEFAULTS["operator_profile"], 100),
+        )
+    except Exception:
+        return {"ok": False, "reason": "subscribe_failed"}
+    return {"ok": True, "reason": "subscribed", "platform": platform, "chat_id": chat_id}
+
+
+def dispatch_outcome_notice(
+    conn: Any, board: str, card: ReviewEvidence, outcome: Outcome, *,
+    escalation_channel: Any = None,
+) -> dict[str, Any]:
+    """Escalate only what a human must decide; a passed review stays silent."""
+    if not outcome.requires_human:
+        return {"ok": True, "reason": "not_required"}
+    notice = render_notice(board, card, outcome)
+    result = deliver_notice(
+        conn, notice, task_id=card.verification_task_id, channel=escalation_channel,
+    )
+    return {**result, "notice": notice}
+
+
 def tool_policy() -> dict[str, Any]:
     return {
         "allowed": ["kanban_read", "kanban_review", "kanban_followup"],

@@ -551,6 +551,63 @@ class NightOperatorIntegration(unittest.TestCase):
                 Off(), tool_name="terminal", args={"command": "echo hi"}, session_id="s1",
             ))
 
+    def test_escalation_delivery_uses_native_notify_sub_and_fails_closed_without_channel(self) -> None:
+        module = _plugin()
+        card = module.ReviewEvidence(
+            verification_task_id="t-1", operator_profile="night-operator",
+            implementation_profiles=("worker-a",), verified_parent_ids=("p-1",),
+            evidence=("event:reviewed",), batch_id="batch-1",
+        )
+        outcome = module.Outcome(
+            "blocked", requires_human=True,
+            reason="needs a human decision", question="proceed?", options=("yes", "no"),
+        )
+        notice = module.render_notice("default", card, outcome)
+
+        with kbc.connect_closing(db_path=self.db) as conn:
+            refused = module.deliver_notice(conn, notice, task_id="t-1", channel=None)
+            self.assertEqual(refused["ok"], False)
+            self.assertEqual(refused["reason"], "no_channel")
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM kanban_notify_subs").fetchone()[0], 0,
+            )
+
+            garbage = module.deliver_notice(conn, notice, task_id="t-1", channel="not a channel")
+            self.assertEqual(garbage["ok"], False)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM kanban_notify_subs").fetchone()[0], 0,
+            )
+
+            delivered = module.deliver_notice(
+                conn, notice, task_id="t-1", channel="telegram:chat-42",
+            )
+            rows = conn.execute(
+                "SELECT platform, chat_id, notifier_profile FROM kanban_notify_subs",
+            ).fetchall()
+        self.assertEqual(delivered["ok"], True)
+        self.assertEqual(delivered["reason"], "subscribed")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["platform"], "telegram")
+        self.assertEqual(rows[0]["chat_id"], "chat-42")
+        self.assertEqual(rows[0]["notifier_profile"], "night-operator")
+
+    def test_no_notification_is_dispatched_for_a_successful_review(self) -> None:
+        module = _plugin()
+        card = module.ReviewEvidence(
+            verification_task_id="t-2", operator_profile="night-operator",
+            implementation_profiles=("worker-a",), verified_parent_ids=("p-1",),
+            evidence=("event:reviewed",), batch_id="batch-2",
+        )
+        outcome = module.Outcome("complete", reason="review passed")
+        with kbc.connect_closing(db_path=self.db) as conn:
+            result = module.dispatch_outcome_notice(
+                conn, "default", card, outcome, escalation_channel="telegram:chat-42",
+            )
+            subs = conn.execute("SELECT COUNT(*) FROM kanban_notify_subs").fetchone()[0]
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(result["reason"], "not_required")
+        self.assertEqual(subs, 0)
+
     def test_artifact_record_count_counts_unique_declared_identities(self) -> None:
         module = _plugin()
         with kbc.connect_closing(db_path=self.db) as conn:
