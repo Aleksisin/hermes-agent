@@ -1,0 +1,20 @@
+name: night-operator
+version: "0.1.0"
+description: "Fail-closed native Hermes Kanban night operator. Disabled and dry-run by default until acceptance is complete."
+kind: standalone
+provides_hooks:
+  - kanban_task_claimed
+  - kanban_task_completed
+  - kanban_task_blocked
+  - on_kanban_dispatch_tick
+provides_tools: []
+config_schema:
+  enabled: {type: bool, default: false, description: "Master kill switch; keep false until acceptance is complete."}
+  dry_run: {type: bool, default: true, description: "Inspect and report only; never write Kanban tasks or comments."}
+  board: {type: str, default: default, description: "Explicit board slug handled by the operator."}
+  review_group_key: {type: str, default: operator_batch, description: "Run metadata key holding an explicit review batch id."}
+  max_review_rounds: {type: int, default: 2, description: "Maximum non-convergent review rounds before human handoff."}
+  reconciliation_interval_seconds: {type: int, default: 300, description: "Bounded reconciliation cadence; a scheduler must call it."}
+  escalation_channel: {type: str, default: "", description: "Optional notification channel name; empty means no external notification."}
+  max_items: {type: int, default: 100, description: "Hard bound for one reconciliation sweep."}
+  operator_profile: {type: str, default: night-operator, description: "Profile name used for operator-created cards."}

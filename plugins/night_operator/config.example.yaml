@@ -1,0 +1,39 @@
+# Safe default example for the night-operator profile.
+# Copy only the relevant sections into the PROFILE config after human approval.
+# No credentials, API keys, OAuth data, or tokens belong in this file.
+
+plugins:
+  # Plugin discovery is opt-in. The plugin can load while its own settings keep
+  # enabled=false and dry_run=true.
+  enabled:
+    - night-operator
+
+  entries:
+    # Flat installs normally use this key. If discovery reports a category key,
+    # use that effective key instead of copying this block blindly.
+    night-operator:
+      settings:
+        enabled: false
+        dry_run: true
+        board: default
+        review_group_key: operator_batch
+        max_review_rounds: 2
+        reconciliation_interval_seconds: 300
+        escalation_channel: null
+        max_items: 100
+        operator_profile: night-operator
+
+# Production candidate from the task specification. These settings are NOT
+# accepted by the plugin tests and must not be applied before separate live
+# scheduler/gateway acceptance:
+#
+# kanban:
+#   dispatch_in_gateway: true
+#   review_dispatch: true
+#   orchestrator_profile: night-operator
+#
+# Write mode additionally requires all of:
+#   plugins.entries.night-operator.settings.enabled: true
+#   plugins.entries.night-operator.settings.dry_run: false
+#   explicit CLI flag: --write
+# and a separate human approval.
