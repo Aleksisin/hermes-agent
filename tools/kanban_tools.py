@@ -328,8 +328,27 @@ def _board(board: Optional[str], *, quiet_close: bool = False):
 
 def _existing_task(kb, conn, tid: str):
     task = kb.get_task(conn, tid)
-    _check(task is not None, f"task {tid} not found")
+    if task is None:
+        _check(False, _missing_card_message(tid))
     return task
+
+
+def _missing_card_message(tid: str) -> str:
+    """What to say when a worker's own card has no row.
+
+    A dispatcher-owned worker whose row is gone (hard-deleted mid-run, 2026-10-10
+    ``t_422bbcde``) has no terminal move left: every board call would refuse and
+    ``agent/kanban_turn_recovery`` cannot find a run to retry in place. Saying "not found" left
+    it retrying against a board that can never accept the handoff, so the message names the
+    situation and tells it to stop — the same contract ``agent/kanban_stop`` enforces from the
+    other side by suppressing the "go call kanban_complete" nudge.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK") == tid:
+        return (
+            f"task {tid} is gone from the board (its row was deleted); no board call can close "
+            "it. Stop working this card and end the turn."
+        )
+    return f"task {tid} not found"
 
 
 def _ok(**fields: Any) -> str:
@@ -795,7 +814,9 @@ def _handle_complete(args: dict, **kw) -> str:
                 raise _Reject(
                     f"could not complete {tid}: unsatisfied parent dependencies: "
                     f"{detail}; complete the parents first (done or archived)")
-            _check(False, (task.last_failure_error if task else None) or
+            if task is None:
+                _check(False, _missing_card_message(tid))
+            _check(False, task.last_failure_error or
                    f"could not complete {tid} (unknown id, stale run, or already terminal)")
         run = kb.latest_run(conn, tid)
         # Artifact staging is atomic with the completion write, so a worker that

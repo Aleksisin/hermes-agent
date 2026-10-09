@@ -30,6 +30,58 @@ _TERMINAL_KANBAN_TOOLS = frozenset({
 _DEFAULT_MAX_ATTEMPTS = 2
 
 
+def _task_row_exists(task_id: str) -> bool:
+    """Whether the board holds a row for ``task_id``. Raises when the board is unreadable."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    with kbc.connect() as conn:
+        return kb.get_task(conn, task_id) is not None
+
+
+def kanban_card_gone(task_id: Optional[str] = None) -> bool:
+    """True only when the board answers authoritatively that this worker's card row is GONE.
+
+    A hard delete takes the card's row, its runs (``task_runs``, the rows
+    ``agent/kanban_turn_recovery.worker_claim_is_live`` reads through
+    ``tasks.current_run_id``) and its events with it, so the worker has no terminal move left:
+    every board call refuses and the in-place recovery cannot find the run it would retry.
+    That is not a handoff to nudge for — it is a dead end, and the stop-nudge asking such a
+    worker to "call kanban_complete" loops against a board that will never accept it
+    (measured 2026-10-10: ``t_422bbcde``).
+
+    Deliberately narrow, in two ways:
+
+    * it requires a dispatcher-pinned run id (``HERMES_KANBAN_RUN_ID``), so a session merely
+      carrying the env var — a cron run or an in-process child — never silences the guard;
+    * it requires BOTH the card row and that run row to be missing, so a card row that was
+      never created (or a probe that cannot see it) is not read as "deleted".
+
+    Fail open: an unreadable board (exception) reports False, so a broken probe can never let a
+    healthy worker exit without its handoff.
+    """
+    tid = (task_id or owned_kanban_task() or "").strip()
+    run_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+    if not tid or not (run_raw or "").strip():
+        return False
+    try:
+        run_id = int(run_raw)
+    except ValueError:
+        return False
+    try:
+        from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
+
+        with kbc.connect() as conn:
+            if kb.get_task(conn, tid) is not None:
+                return False
+            return conn.execute(
+                "SELECT 1 FROM task_runs WHERE id = ?", (run_id,),
+            ).fetchone() is None
+    except Exception:
+        return False
+
+
 def kanban_stop_nudge_enabled() -> bool:
     """On when ``HERMES_KANBAN_TASK`` is set for the dispatcher-owned worker, unless
     ``HERMES_KANBAN_STOP_NUDGE`` disables it. In-process delegate_task children and cron runs
@@ -74,6 +126,7 @@ def build_kanban_stop_nudge(
         not kanban_stop_nudge_enabled()
         or attempts >= max_attempts
         or session_called_kanban_terminal(messages)
+        or kanban_card_gone(task_id)
     ):
         return None
 
