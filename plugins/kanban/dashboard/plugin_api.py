@@ -719,9 +719,33 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 @router.delete("/tasks/{task_id}")
 def delete_task(task_id: str, board: Optional[str] = Query(None)):
     with _board_conn(board) as (board, conn):
+        _require_task(conn, task_id)
         if not kanban_db.delete_task(conn, task_id):
-            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+            # Refused, not missing: the card's run is still live (or the row vanished
+            # concurrently). A live card is never deleted out from under its worker
+            # (2026-10-10: this route deleted a ``running`` card whose worker was still
+            # working it, orphaning the agent), the refusal is on the card's event log, and
+            # the detail says how to release the run.
+            raise HTTPException(status_code=409, detail=_live_run_delete_refusal(conn, task_id))
         return {"deleted": True, "task_id": task_id}
+
+
+def _live_run_delete_refusal(conn: sqlite3.Connection, task_id: str) -> str:
+    """Why the delete was refused, naming the card, the worker pid and the escape."""
+    events = kanban_db.list_events(conn, task_id)
+    payload = next(
+        (e.payload for e in reversed(events)
+         if e.kind == "delete_refused" and isinstance(e.payload, dict)),
+        None,
+    )
+    if not payload:
+        return f"task {task_id} was not deleted (its row changed concurrently); retry once it settles"
+    pid = payload.get("worker_pid")
+    who = f"pid {pid}" if pid else "a worker we cannot see"
+    return (
+        f"task {task_id} is not deleted: {payload.get('reason_text', 'its run is still live')} "
+        f"({who}, {payload.get('liveness')}). {payload.get('escape', '')}".strip()
+    )
 
 
 def _parents_blocking_ready(conn: sqlite3.Connection, task_id: str) -> list:

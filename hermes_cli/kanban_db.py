@@ -3862,26 +3862,161 @@ def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
 
 
-def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Hard-delete an ARCHIVED task (+ related rows); anything else must be
-    archived first so data loss takes two deliberate actions."""
+# --- Hard delete: the live-run fence -----------------------------------------
+#
+# Deleting a task row is irreversible AND it takes the card's whole record with it: the row a
+# running worker reports to, its runs (the pid + spawn fingerprint of the process) and its
+# events. Measured on the ibf board 2026-10-10: `t_422bbcde` (``running``, run 1118, worker pid
+# 19096) was deleted while its worker was still working — ``sqlite_sequence`` then read
+# ``task_runs = 1118`` with no row and no event of that run left, and every remaining board call
+# of the worker refused (``task t_422bbcde not found``, ``could not heartbeat …``,
+# ``could not complete …``). The agent was orphaned with nothing to report to and no way to
+# close. ``delete_task`` had no live-run check at all while its sibling
+# ``delete_archived_task`` demanded an explicit archive first, so the dashboard's single-task
+# and bulk "Delete" buttons (``DELETE /api/plugins/kanban/tasks/{id}``) were a one-click hole.
+#
+# The fence is "provably gone", not "not running": a reclaim/reap that released the claim but
+# left the process alive must refuse too — the same fact that makes ``reap_terminal_workers``
+# keep the pid evidence it needs.
+_DELETE_REFUSED_EVENT = "delete_refused"
+_DELETE_LIVE_REASONS = {
+    "live_worker": (
+        "its run is still live and its worker is still working the card"
+    ),
+    "archived_live_worker": (
+        "its run was archived with its worker still alive; the closed run holds the pid and "
+        "spawn fingerprint needed to end that process"
+    ),
+}
+_DELETE_LIVE_ESCAPE = (
+    "release the run first (`hermes kanban reclaim {task_id}`, or block the card) once you know "
+    "nothing of ours is still working it"
+)
+
+
+def _delete_refusal_evidence(conn: sqlite3.Connection, task_row: sqlite3.Row) -> Optional[dict[str, Any]]:
+    """Why hard-deleting this card would delete a live run's only record, or None when safe.
+
+    Two pieces of evidence, both requiring a claim issued by THIS host (a worker claimed
+    elsewhere cannot be seen or signalled from here, so its delete is not ours to refuse):
+
+    * a ``running`` card whose ``worker_pid`` still answers ``_worker_alive`` — pid existence
+      AND the spawn-time fingerprint, so a recycled PID is read as "worker gone" (deletable)
+      while an UNVERIFIED fingerprint (capture failed at spawn) refuses: its identity can
+      never be proven, and the delete cannot be undone;
+    * a ``running`` card whose ``last_heartbeat_at`` is fresher than
+      ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` even when the pid probe cannot see it —
+      the same superset of "spare a live claim" ``release_stale_claims`` uses
+      (refusing costs one ``hermes kanban reclaim``, waving a live worker through costs the
+      worker);
+    * an ``archived`` card whose closed run still carries a host-local ``worker_pid`` that is
+      alive: an archive that could not signal the process (UNVERIFIED fingerprint) leaves
+      exactly this record, and it is the last one — ``reap_terminal_workers`` reads it to end
+      the worker.
+    """
+    status = task_row["status"]
+    task_id = task_row["id"]
+    if status in ("running", "archived") and (task_row["claim_lock"] or "").startswith(_host_prefix()):
+        pid = _opt_int(task_row["worker_pid"])
+        if pid and _worker_alive(pid, _row_get(task_row, "worker_started_at")):
+            return {
+                "reason": "live_worker", "status": status, "worker_pid": pid,
+                "liveness": "pid_alive",
+            }
+        if status == "running":
+            heartbeat = task_row["last_heartbeat_at"]
+            age = None if heartbeat is None else int(time.time()) - int(heartbeat)
+            if age is not None and age <= DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS:
+                return {
+                    "reason": "live_worker", "status": status, "worker_pid": pid,
+                    "liveness": "fresh_heartbeat", "heartbeat_age": age,
+                }
+    if status == "archived":
+        run = conn.execute(
+            "SELECT id, worker_pid, worker_started_at, claim_lock FROM task_runs "
+            "WHERE task_id = ? AND worker_pid IS NOT NULL ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if (run is not None and (run["claim_lock"] or "").startswith(_host_prefix())
+                and _worker_alive(run["worker_pid"], run["worker_started_at"])):
+            return {
+                "reason": "archived_live_worker", "status": status,
+                "worker_pid": _opt_int(run["worker_pid"]), "run_id": run["id"],
+                "liveness": "pid_alive",
+            }
+    return None
+
+
+def _hard_delete_task(conn: sqlite3.Connection, task_id: str, *, require_archived: bool) -> bool:
+    """Refuse a card with a live run, else delete it and its related rows in one txn.
+
+    ``require_archived`` is the two-step rule of :func:`delete_archived_task`; the live-run
+    fence precedes it, so a refusal is recorded with its evidence (``delete_refused``) whether
+    part of the record is on disk or not — and it happens BEFORE any row is written.
+    """
     with write_txn(conn):
-        if _task_status(conn, task_id) != "archived":
+        row = conn.execute(
+            "SELECT id, status, claim_lock, worker_pid, worker_started_at, last_heartbeat_at "
+            "FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        live = _delete_refusal_evidence(conn, row)
+        if live is not None:
+            _append_event(conn, task_id, _DELETE_REFUSED_EVENT, {
+                **live,
+                "reason_text": _DELETE_LIVE_REASONS[live["reason"]],
+                "escape": _DELETE_LIVE_ESCAPE.format(task_id=task_id),
+            })
+            return False
+        if require_archived and row["status"] != "archived":
             return False
         _delete_task_relations(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
 
 
+def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Hard-delete an ARCHIVED task (+ related rows); anything else must be
+    archived first so data loss takes two deliberate actions. A card whose archived run
+    still has a live host-local worker is refused (see :func:`_hard_delete_task`)."""
+    return _hard_delete_task(conn, task_id, require_archived=True)
+
+
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Hard-delete a task and its related rows in one txn; False when not found."""
-    with write_txn(conn):
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        if cur.rowcount != 1:
-            return False
-        _delete_task_relations(conn, task_id)
-    recompute_ready(conn)
-    return True
+    """Hard-delete a task and its related rows in one txn; False when not found.
+
+    False also when the card's run is still live (:func:`_delete_refusal_evidence`): the card
+    IS the record its worker reports to, so deleting it orphans a running agent silently
+    (2026-10-10, ``t_422bbcde``). The refusal is written to the card's own event log as
+    ``delete_refused`` with the pid and the escape, and nothing else is touched.
+    """
+    ok = _hard_delete_task(conn, task_id, require_archived=False)
+    if ok:
+        # ``running`` parents no longer block children once the row is gone.
+        recompute_ready(conn)
+    return ok
+
+
+def delete_refusal_info(conn: sqlite3.Connection, task_id: str) -> Optional[dict[str, Any]]:
+    """Read-only: why a hard delete of ``task_id`` would be refused right now, or None.
+
+    The refusal *reason text* an operator needs (which worker pid is still holding the card, and
+    what to do about it) without attempting — and therefore without waiting for — the delete.
+    Reporting only: the authority stays :func:`_hard_delete_task`'s own fence inside the write
+    transaction, which returns False for every caller: CLI, dashboard and worker tools alike.
+    """
+    row = conn.execute(
+        "SELECT id, status, claim_lock, worker_pid, worker_started_at, last_heartbeat_at "
+        "FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    live = _delete_refusal_evidence(conn, row)
+    if live is None:
+        return None
+    return {**live, "reason_text": _DELETE_LIVE_REASONS[live["reason"]],
+            "escape": _DELETE_LIVE_ESCAPE.format(task_id=task_id)}
 
 
 def schedule_task(

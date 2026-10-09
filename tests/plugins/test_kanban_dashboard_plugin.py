@@ -450,6 +450,46 @@ def test_delete_task(client):
     r = client.get(f"/api/plugins/kanban/tasks/{t['id']}")
     assert r.status_code == 404
 
+
+def test_delete_task_refuses_card_with_live_run(client, monkeypatch):
+    """A running card must not be deleted out from under its worker (2026-10-10).
+
+    The panel's Delete button hits this route; it deleted a ``running`` card whose worker was
+    still working it, after which every remaining board call of that worker refused and the
+    agent had no row left to report to. The route now answers 409 with the pid and the escape,
+    records the refusal on the card, and leaves the card (and its run) exactly as it was.
+    """
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "live", "assignee": "a"}).json()["task"]
+    with kbc.connect() as conn:
+        assert kb.claim_task(conn, t["id"], claimer=f"{kb._host_prefix()}worker")
+        kbd._set_worker_pid(conn, t["id"], 54321)
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: True)
+
+    r = client.delete(f"/api/plugins/kanban/tasks/{t['id']}")
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert t["id"] in detail and "54321" in detail, detail
+
+    # Still on the board, its run and events intact, the refusal recorded on the card.
+    assert client.get(f"/api/plugins/kanban/tasks/{t['id']}").status_code == 200
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, t["id"]).status == "running"
+        kinds = [e.kind for e in kb.list_events(conn, t["id"])]
+        assert kinds.count("delete_refused") == 1
+
+    # Green control: once the worker is provably gone the same call deletes.
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+    r = client.delete(f"/api/plugins/kanban/tasks/{t['id']}")
+    assert r.status_code == 200, r.text
+    assert r.json()["deleted"] is True
+
+
+def test_delete_task_still_404s_unknown_id(client):
+    r = client.delete("/api/plugins/kanban/tasks/t_doesnotexist")
+    assert r.status_code == 404
+
 # ---------------------------------------------------------------------------
 # Comments + Links
 # ---------------------------------------------------------------------------

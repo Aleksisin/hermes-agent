@@ -1119,6 +1119,23 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _delete_refusal_line(conn, task_id: str) -> Optional[str]:
+    """Refusal line for a card ``delete_archived_task`` would not delete.
+
+    Reporting only — the authority is the DB layer's own fence, which every caller passes
+    through; ``delete_refusal_info`` is the same predicate read back so the line can name the
+    worker pid instead of a bare "cannot delete". ``None`` when the refusal was the ordinary
+    two-step rule (not archived), which the caller's ``fail_msg`` already says.
+    """
+    live = kb.delete_refusal_info(conn, task_id)
+    if not live:
+        return None
+    pid = live.get("worker_pid")
+    who = f"pid {pid}" if pid else "a worker we cannot see"
+    return (f"cannot delete {task_id}: {live.get('reason_text', 'its run is still live')} "
+            f"({who}, {live.get('liveness')})")
+
+
 def _cmd_archive(args: argparse.Namespace) -> int:
     ids = list(args.task_ids or [])
     purge_ids = list(getattr(args, "purge_ids", None) or [])
@@ -1128,8 +1145,11 @@ def _cmd_archive(args: argparse.Namespace) -> int:
         return _err("at least one task_id is required")
     with kbc.connect_closing() as conn:
         if purge_ids:
-            return _bulk_apply(purge_ids, lambda tid: kb.delete_archived_task(conn, tid), lambda tid: f"Deleted {tid}",
-                               lambda tid: f"cannot delete {tid} (must already be archived)")
+            return _bulk_apply(
+                purge_ids, lambda tid: kb.delete_archived_task(conn, tid), lambda tid: f"Deleted {tid}",
+                lambda tid: f"cannot delete {tid} (must already be archived)",
+                explain=lambda tid: _delete_refusal_line(conn, tid),
+            )
         return _bulk_apply(ids, lambda tid: kb.archive_task(conn, tid),
                            lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}")
 
